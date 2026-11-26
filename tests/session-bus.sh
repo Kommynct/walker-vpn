@@ -34,3 +34,13 @@ else
 fi
 [[ $(wc -l < "$attempts") == 1 ]]
 echo 'An unrelated startup failure preserved the original exit code without a retry.'
+
+: > "$attempts"
+bash "$lib/app-session.sh" "$proxy" "$(command -v dbus-run-session)" "$namespace" org.example.App \
+    bash -c '
+        printf "%s\n" "$DBUS_SESSION_BUS_ADDRESS" >> "$attempts"
+        busctl --address="$DBUS_SESSION_BUS_ADDRESS" call org.freedesktop.DBus \
+            /org/freedesktop/DBus org.freedesktop.DBus RequestName su org.example.Worker 0 || :
+    ' > /dev/null 2>&1
+[[ $(wc -l < "$attempts") == 1 ]]
+echo 'A successful app is never relaunched after a bus denial.'

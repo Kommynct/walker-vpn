@@ -5,7 +5,9 @@ wgmark=51872
 bootstrap_mark=0x575651
 api_uid_pref=11000
 bootstrap_pref=11001
+app_route_pref=11002
 tunnel_return_pref=11003
+app_deny_pref=11004
 tunnel_pref=11010
 profile=$run/$iface.conf
 
@@ -24,7 +26,7 @@ valid_hostname() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$ ]]; }
 valid_region() { [[ $1 =~ ^[a-zA-Z0-9_-]{1,64}$ ]]; }
 
 guard_init() {
-    local api_uid installed rules endpoint record veth uplink pair
+    local api_uid rules installed uid_rule mark_rule endpoint record veth uplink pair
     api_uid=$(id -u walker-vpn-api) || return 1
     if ! nft list table inet walkervpn >/dev/null 2>&1; then
         local restore_output= restore_forward=
@@ -106,16 +108,17 @@ RULES
     rules=$(ip -j -4 rule show) || return 1
     # Select the uplink source address at socket connect time. The nftables
     # route hook marks the approved connection for return-path filtering.
-    installed=$(jq -r --argjson pref "$api_uid_pref" '.[] | select(.priority == $pref) |
-        [.uid_start, .uid_end, .table] | join(" ")' <<< "$rules") || return 1
-    case "$installed" in
+    installed=$(jq -er --argjson uid "$api_uid_pref" --argjson mark "$bootstrap_pref" '
+        def rule($pref; fields): [.[] | select(.priority == $pref) | fields | join(" ")] | join(";");
+        [rule($uid; [.uid_start, .uid_end, .table]), rule($mark; [.fwmark, .table])] | join("|")
+    ' <<< "$rules") || return 1
+    IFS='|' read -r uid_rule mark_rule <<< "$installed"
+    case "$uid_rule" in
         "$api_uid $api_uid main") ;;
         '') ip -4 rule add pref "$api_uid_pref" uidrange "$api_uid-$api_uid" lookup main || return 1 ;;
         *) printf 'The routing priority %s is already in use.\n' "$api_uid_pref" >&2; return 1 ;;
     esac
-    installed=$(jq -r --argjson pref "$bootstrap_pref" '.[] | select(.priority == $pref) |
-        [.fwmark // "", .table // ""] | join(" ")' <<< "$rules") || return 1
-    case "$installed" in
+    case "$mark_rule" in
         "$bootstrap_mark main") ;;
         '') ip -4 rule add pref "$bootstrap_pref" fwmark "$bootstrap_mark" lookup main || return 1 ;;
         *) printf 'The routing priority %s is already in use.\n' "$bootstrap_pref" >&2; return 1 ;;

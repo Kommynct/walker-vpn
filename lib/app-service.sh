@@ -18,8 +18,11 @@ app_cleanup() {
                 nft -f - >&2 || :
         fi
         nft -f - <<< "destroy table inet $namespace" >&2 || :
-        if [[ $mode == direct ]]; then
-            ip -4 rule del pref 11002 iif "$veth" lookup main 2>/dev/null || :
+        if [[ -n ${app_route_table:-} ]]; then
+            ip -4 rule del pref "$app_route_pref" iif "$veth" lookup "$app_route_table" 2>/dev/null || :
+        fi
+        if [[ ${app_route_denied:-false} == true ]]; then
+            ip -4 rule del pref "$app_deny_pref" iif "$veth" prohibit 2>/dev/null || :
         fi
     fi
     if [[ -n ${vpn_pid:-} ]]; then
@@ -36,6 +39,7 @@ app_cleanup() {
 
 app_policy() {
     local links inside wgdev uplink_index endpoint peer_ip peer_port mark allowed reverse_mark=
+    local route_table=main
     links=$(ip -n "$namespace" -j -d link show | jq -er '
         [.[] | select(.linkinfo.info_kind == "veth")] as $interfaces |
         [.[] | select(.linkinfo.info_kind == "wireguard")] as $tunnels |
@@ -96,8 +100,16 @@ table inet $namespace {
     }
 }
 RULES
+    if [[ $mode == direct || $use_host_tunnel == true ]]; then
+        # Stop route lookup if the selected table has no route. This remains
+        # in force if a firewall reload removes the host-side nftables policy.
+        if [[ $use_host_tunnel == true ]]; then route_table=$wgmark; fi
+        ip -4 rule add pref "$app_deny_pref" iif "$veth" prohibit >&2 || return 1
+        app_route_denied=true
+        ip -4 rule add pref "$app_route_pref" iif "$veth" lookup "$route_table" >&2 || return 1
+        app_route_table=$route_table
+    fi
     if [[ $mode == direct ]]; then
-        ip -4 rule add pref 11002 iif "$veth" lookup main >&2 || return 1
         [[ $uplink_index =~ ^[0-9]+$ ]] || return 1
         local indices="$link_index . $uplink_index"
         printf 'add element inet walkervpn direct { %s }\n' "$indices" | nft -f - >&2 || return 1
@@ -109,6 +121,7 @@ RULES
 launch_app() {
     local app_kind app_id uid gid home user_entry job forward_files argc result=0
     mode= namespace= work= veth= pair= vpn_pid= active_record= active_lease= app_iface=
+    app_route_table= app_route_denied=false
     local link_index uplink use_host_tunnel=false
     local item marker wait_start
     local -a fields=() args=() session=() dns=() options=()

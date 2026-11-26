@@ -31,25 +31,9 @@ if [[ -d /run/systemd/resolve ]]; then
     mount -t tmpfs -o size=4k,mode=000 tmpfs /run/systemd/resolve || exit 1
 fi
 
-# Flatpak's runtime may not mount the NixOS timezone file or its store path.
-# Pass a zone identifier so libc and JavaScript resolve it using their own tzdata.
-timezone=
-for setting in "${session[@]}"; do
-    if [[ $setting == TZ=* ]]; then timezone=${setting#TZ=}; break; fi
-done
-if [[ -z $timezone || $timezone == /* || $timezone == :/* ]]; then
-    zonefile=$(readlink -f /etc/localtime) || zonefile=
-    if [[ $zonefile == */zoneinfo/* ]]; then
-        timezone=${zonefile#*/zoneinfo/}
-    elif [[ -r /etc/timezone ]]; then
-        IFS= read -r timezone < /etc/timezone || :
-    fi
-fi
-if [[ $timezone =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]]; then
-    session+=("TZ=$timezone")
-    flatpak_timezone=("--env=TZ=$timezone")
-else
-    flatpak_timezone=()
+source "${BASH_SOURCE[0]%/*}/session-env.sh"
+if zoneinfo=$(desktop_zoneinfo_dir /etc/localtime); then
+    session+=("TZDIR=$zoneinfo")
 fi
 
 if [[ $kind == flatpak ]]; then
@@ -93,8 +77,10 @@ if [[ $kind == flatpak ]]; then
         set -- --command=sh "$app_id" -c "$check" walker-vpn \
             "$app_iface" "$command" "${dns[@]}" -- "$@"
     fi
+    # Flatpak uses the host TZDIR to set up /etc/localtime, then the app
+    # resolves named zones using the database visible inside the sandbox.
     set -- "${WALKER_VPN_FLATPAK:-flatpak}" run --share=network --nosocket=session-bus --nosocket=system-bus \
-        --talk-name=org.kde.StatusNotifierWatcher --no-talk-name=org.freedesktop.Flatpak "${flatpak_timezone[@]}" "$@"
+        --talk-name=org.kde.StatusNotifierWatcher --no-talk-name=org.freedesktop.Flatpak --unset-env=TZDIR "$@"
 else
     if [[ -x ${WALKER_VPN_LINK_OPENER:-} ]]; then
         # Some applications use the desktop opener's absolute path.

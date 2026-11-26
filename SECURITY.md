@@ -13,6 +13,6 @@ Walker VPN protects direct IP traffic from apps started through a managed launch
 
 ## Checks
 
-A launch requires a separate mount and network namespace, the expected interface, DNS configuration, and the namespace’s default-drop output chain. The Flatpak launcher checks for the expected network interface and resolver configuration from inside its sandbox. The desktop and backend regression tests exercise shortcut migration, MIME arguments, route mismatch rejection, and detached-process lifetime.
+A launch requires a separate mount and network namespace, the expected interface, DNS configuration, and the namespace’s default-drop output chain. Host routing rules stop forwarded app traffic when its selected routing table has no route. This applies to excluded apps using the main table and VPN-only apps using the host tunnel. The Flatpak launcher also checks for the expected network interface and resolver configuration from inside its sandbox. The regression tests cover shortcut migration, MIME arguments, route mismatch rejection, and detached-process lifetime.
 
 Testing the kernel, Flatpak, systemd, Vopono, and PIA implementations themselves is outside the scope of this project.

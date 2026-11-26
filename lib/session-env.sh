@@ -8,3 +8,26 @@ app_session_keys=(
     GTK_THEME GTK_PATH GDK_BACKEND GSETTINGS_SCHEMA_DIR XCURSOR_THEME XCURSOR_SIZE
     PIPEWIRE_REMOTE PULSE_SERVER PATH
 )
+
+desktop_zoneinfo_dir() {
+    local localtime=$1 target directory
+    # Flatpak compares the immediate localtime symlink with TZDIR. Keep the
+    # configured path even when the directory itself is a symlink.
+    if target=$(readlink -- "$localtime"); then
+        if [[ $target != /* ]]; then target=${localtime%/*}/$target; fi
+        case $target in
+            *//*|*/./*|*/../*) target=$(realpath --canonicalize-missing --no-symlinks -- "$target") || return 1 ;;
+        esac
+        if [[ $target == */zoneinfo/* && -r $target ]]; then
+            printf '%s/zoneinfo\n' "${target%/zoneinfo/*}"
+            return 0
+        fi
+    fi
+    for directory in "${TZDIR:-}" /etc/zoneinfo /usr/share/zoneinfo; do
+        if [[ $directory == /* && -d $directory ]]; then
+            printf '%s\n' "$directory"
+            return 0
+        fi
+    done
+    return 1
+}

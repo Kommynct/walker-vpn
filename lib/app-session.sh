@@ -83,7 +83,7 @@ child=
 stop_proxy
 denied=0
 if [[ -s $directory/own-denied ]]; then denied=$(< "$directory/own-denied"); fi
-if [[ $denied =~ ^[1-9][0-9]*$ && -x $dbus_session ]] && (( EPOCHSECONDS - denied <= 5 )); then
+if [[ $denied =~ ^[1-9][0-9]*$ && -x $dbus_session ]] && (( result != 0 && EPOCHSECONDS - denied <= 5 )); then
     # Give internal helpers their own bus without granting access to host services.
     if mkdir -m 700 -- "$private" 2>/dev/null; then
         owns_private=true

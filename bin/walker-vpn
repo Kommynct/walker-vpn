@@ -66,21 +66,20 @@ first_setup() {
 }
 
 format_waybar() {
-    local status=$1 connection kill region label
+    local status=$1
     if [[ -z $status ]]; then
         jq -nc '{text:"󰖂",tooltip:"VPN setup unavailable",class:"unavailable"}'
         return
     fi
-    IFS=$'\t' read -r connection kill region < <(jq -r '[.connection,.kill,.region] | @tsv' <<< "$status")
-    case "$connection" in
-        connected) label=Connected ;;
-        connecting|reconnecting) label=${connection^} ;;
-        *) label=Disconnected ;;
-    esac
-    if [[ $kill == degraded ]]; then label+=' · Kill switch needs attention'; fi
-    jq -nc --arg tip "VPN · $label${region:+ · $region}
-Kill switch: $kill" --arg connection "$connection" --arg kill "$kill" \
-        '{text:"󰖂",tooltip:$tip,class:[$connection,("kill-" + $kill)]}'
+    jq -c '
+        ({connected:"Connected", connecting:"Connecting", reconnecting:"Reconnecting"}[.connection]
+            // "Disconnected") as $label |
+        {text:"󰖂",
+         tooltip: ("VPN · " + $label +
+             (if .kill == "degraded" then " · Kill switch needs attention" else "" end) +
+             (if .region == "" then "" else " · " + .region end) + "\nKill switch: " + .kill),
+         class: [.connection, ("kill-" + .kill)]}
+    ' <<< "$status"
 }
 
 waybar() {
