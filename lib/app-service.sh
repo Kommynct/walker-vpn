@@ -233,20 +233,23 @@ launch_app() {
 # Some desktop launchers detach the GUI and exit while it still needs the
 # namespace. Track its members instead of the original launcher's lifetime.
 wait_for_app_processes() {
-    local namespace=$1 uid=$2 members pid key real_uid rest found
+    local namespace=$1 uid=$2 members pid key real_uid rest live_pid
     while members=$(ip netns pids "$namespace"); do
-        found=false
+        live_pid=
         for pid in $members; do
             [[ $pid =~ ^[1-9][0-9]*$ && /proc/$pid/ns/net -ef $app_netns_dir/$namespace ]] || continue
             while read -r key real_uid rest; do
                 [[ $key == Uid: ]] || continue
-                if [[ $real_uid == "$uid" ]]; then found=true; fi
+                if [[ $real_uid == "$uid" ]]; then live_pid=$pid; fi
                 break
             done 2>/dev/null < "/proc/$pid/status"
-            if [[ $found == true ]]; then break; fi
+            [[ -z $live_pid ]] || break
         done
-        [[ $found == true ]] || return 0
-        sleep 1
+        [[ -n $live_pid ]] || return 0
+        # Keep watching the same process until another namespace scan is needed.
+        while [[ /proc/$live_pid/ns/net -ef $app_netns_dir/$namespace ]]; do
+            sleep 1
+        done
     done
 }
 

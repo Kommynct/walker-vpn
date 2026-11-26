@@ -1,54 +1,8 @@
+source "${BASH_SOURCE[0]%/*}/desktop-entry.sh"
+
 desktop_data=${XDG_DATA_HOME:-$HOME/.local/share}
 desktop_root=${XDG_STATE_HOME:-$HOME/.local/state}/walker-vpn/apps
 command_dir=$desktop_root/bin
-
-desktop_id() { [[ $1 =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,199}\.desktop$ ]]; }
-
-desktop_roots() {
-    local dir
-    printf '%s\n' "$desktop_data/applications" \
-        "$desktop_data/flatpak/exports/share/applications" /var/lib/flatpak/exports/share/applications \
-        "$desktop_root/commands"
-    local -a dirs
-    IFS=: read -ra dirs <<< "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
-    for dir in "${dirs[@]}"; do
-        [[ -n $dir ]] && printf '%s/applications\n' "$dir"
-    done
-}
-
-desktop_file() {
-    local dir found
-    while IFS= read -r dir; do
-        found=$dir/$1
-        if [[ -f $found ]]; then printf '%s\n' "$found"; return 0; fi
-    done <<< "$(desktop_roots)"
-    return 1
-}
-
-desktop_value() {
-    awk -v key="$2" '
-        /^\[/ { entry=($0 == "[Desktop Entry]") }
-        entry && index($0, key "=") == 1 { print substr($0,length(key)+2); exit }
-    ' "$1"
-}
-
-desktop_executable() {
-    local rest=$1 token
-    local pattern='^[[:space:]]*("([^"]+)"|([^[:space:]]+))[[:space:]]*(.*)$'
-    while [[ $rest =~ $pattern ]]; do
-        token=${BASH_REMATCH[2]:-${BASH_REMATCH[3]}}
-        rest=${BASH_REMATCH[4]}
-        case "${token##*/}" in
-            env|gamemoderun|prime-run|steam-run|--|-i|--ignore-environment|*=*) ;;
-            -u|-C|--unset|--chdir)
-                [[ $rest =~ $pattern ]] || return 1
-                rest=${BASH_REMATCH[4]}
-                ;;
-            *) printf '%s\n' "$token"; return ;;
-        esac
-    done
-    return 1
-}
 
 can_route_command() {
     [[ $1 =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.+-]{0,150}$ ]] || return 1
@@ -286,23 +240,6 @@ restore_network() {
     mv -f -- "$temporary" "$path"
 }
 
-flatpak_desktop_app() {
-    local exec_line=$1 executable
-    executable=$(desktop_executable "$exec_line") || return 1
-    [[ ${executable##*/} == flatpak ]] || return 1
-    awk '
-        {
-            for (i=1; i<=NF && $i!="run"; i++) {}
-            for (i++; i<=NF; i++) {
-                if ($i ~ /^--/) continue
-                if ($i ~ /^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+){2,}$/) { print $i; found=1 }
-                break
-            }
-        }
-        END { if (!found) exit 1 }
-    ' <<< "$exec_line"
-}
-
 shortcut_owner() {
     local id=$1 file=$2 line linked ignored canonical
     line=$(desktop_value "$file" Exec)
@@ -342,41 +279,6 @@ refresh_desktop_launchers() {
     return 0
 }
 
-render_desktop() {
-    local source=$1 id=$2 kind=$3 sibling=${4:-false}
-    awk -v id="$id" -v kind="$kind" -v sibling="$sibling" '
-        /^\[/ { entry=($0 == "[Desktop Entry]"); action=($0 ~ /^\[Desktop Action /) }
-        entry && /^DBusActivatable=/ { next }
-        (entry || action) && /^Exec=/ {
-            line=substr($0,6)
-            prefix="Exec=walker-vpn desktop " id
-            if (kind=="flatpak") {
-                # Flatpak exports supply an explicit command followed by the app ID.
-                app=id
-                sub(/\.desktop$/, "", app)
-                found=0
-                command=""
-                while (match(line, /^[^[:space:]]+[[:space:]]*/)) {
-                    token=substr(line,1,RLENGTH)
-                    line=substr(line,RLENGTH+1)
-                    sub(/[[:space:]]+$/, "", token)
-                    if (token==app) { found=1; break }
-                    if (token ~ /^--command=[A-Za-z0-9_./][A-Za-z0-9_./+-]*$/) command=substr(token,11)
-                }
-                if (!found) { if (entry) exit 1; next }
-                gsub(/(^|[[:space:]])@@[uU]?([[:space:]]|$)/, " ", line)
-                if ((action || sibling=="true") && command!="") prefix=prefix " --flatpak-command " command
-            }
-            print prefix " -- " line
-            next
-        }
-        entry && /^\[Desktop Entry\]$/ {
-            print; print "DBusActivatable=false"; print "X-Walker-VPN-Managed=true"; next
-        }
-        { print }
-    ' "$source"
-}
-
 replace_launcher() (
     local source=$1 target=$2 temporary
     temporary=$(mktemp "${target%/*}/.walker.XXXXXXXX") || return 1
@@ -389,6 +291,7 @@ sync_shortcuts() {
     local legacy mode line
     local PATH=$(unrouted_path)
     local -A seen=()
+    local -a fields=()
     if [[ $kind == flatpak ]]; then
         executable=${id%.desktop}
     else
@@ -419,7 +322,9 @@ sync_shortcuts() {
                 fi
             fi
             seen[$alias]=1
-            line=$(desktop_value "$file" Exec)
+            mapfile -d '' -t fields < <(desktop_launch_fields "$file")
+            [[ ${#fields[@]} == 3 && ${fields[1]} != true && ${fields[2]} != true ]] || continue
+            line=${fields[0]}
             if [[ $kind == flatpak ]]; then
                 other=$(flatpak_desktop_app "$line") || continue
                 [[ $other == "$executable" ]] || continue
@@ -428,7 +333,6 @@ sync_shortcuts() {
                 other=$(type -P -- "$other") || continue
                 [[ $other -ef $executable ]] || continue
             fi
-            [[ $(desktop_value "$file" Hidden) != true && $(desktop_value "$file" Terminal) != true ]] || continue
             mkdir -p "$entry" || return 1
             if [[ -f $legacy/original ]]; then
                 cp -L -p -- "$legacy/original" "$entry/original" || return 1

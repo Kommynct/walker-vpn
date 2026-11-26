@@ -7,6 +7,7 @@ let
   } ''
     install -Dm755 ${./bin/walker-vpn} "$out/bin/walker-vpn"
     install -Dm644 ${./lib/desktop.sh} "$out/lib/desktop.sh"
+    install -Dm644 ${./lib/desktop-entry.sh} "$out/lib/desktop-entry.sh"
     install -Dm644 ${./lib/session-env.sh} "$out/lib/session-env.sh"
     patchShebangs "$out/bin"
     wrapProgram "$out/bin/walker-vpn" --prefix PATH : ${lib.makeBinPath (with pkgs; [

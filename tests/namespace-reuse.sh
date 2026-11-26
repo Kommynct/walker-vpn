@@ -49,12 +49,15 @@ ln -s /proc/self/ns/net "$app_netns_dir/$namespace"
 bash -c 'exec sleep 30' &
 detached=$!
 trap 'kill "$detached" 2>/dev/null || :; rm -rf "$scratch"' EXIT
-ip() { printf '%s\n' "$detached"; }
+ip() { echo scan >> "$scratch/scans"; printf '%s\n' "$detached"; }
+polls=0
 sleep() {
+    polls=$((polls + 1))
+    [[ $polls == 3 ]] || return 0
     kill "$detached"
     wait "$detached" 2>/dev/null || :
     touch "$scratch/kept-alive"
 }
 wait_for_app_processes "$namespace" "$UID"
-[[ -f $scratch/kept-alive ]]
+[[ -f $scratch/kept-alive && $(wc -l < "$scratch/scans") == 2 ]]
 printf 'Detached apps keep the protected namespace alive until the last process exits.\n'

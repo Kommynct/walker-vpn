@@ -19,6 +19,13 @@ if [[ ! -s /etc/resolv.conf ]] || ! ip link show dev "$app_iface" >/dev/null; th
     exit 1
 fi
 
+if ! nft -j list chain inet walker_app output | jq -e '
+    any(.nftables[].chain?; .hook == "output" and .type == "filter" and .policy == "drop")
+' >/dev/null; then
+    printf 'The app namespace is missing its default-drop firewall.\n' >&2
+    exit 1
+fi
+
 # nss-resolve uses a host Unix socket. Hide it within this mount namespace.
 if [[ -d /run/systemd/resolve ]]; then
     mount -t tmpfs -o size=4k,mode=000 tmpfs /run/systemd/resolve || exit 1
@@ -46,16 +53,13 @@ else
 fi
 
 if [[ $kind == flatpak ]]; then
-    # Pin the desktop user's destination by fd. The private mount namespace and
-    # the ownership check keep this bind off system and other users' directories.
-    monitor=$runtime/.flatpak-helper/monitor
-    exec {monitor_fd}<"$monitor" || exit 1
-    target=/proc/self/fd/$monitor_fd
-    [[ -d $target && $(stat -L -c %u "$target") == "$uid" ]] || exit 1
-    # The fd-based libmount backend rejects a /proc/self/fd mount target.
-    # The classic bind syscall resolves the pinned directory instead.
-    LIBMOUNT_FORCE_MOUNT2=always mount --no-canonicalize --bind "$work/monitor" "$target" || exit 1
-    exec {monitor_fd}<&-
+    # Enter the directory first so the kernel pins the target and rejects
+    # other file types. Mount only within this private mount namespace.
+    (
+        cd -P -- "$runtime/.flatpak-helper/monitor" || exit 1
+        [[ $(stat -c %u .) == "$uid" ]] || exit 1
+        LIBMOUNT_FORCE_MOUNT2=always mount --no-canonicalize --bind "$work/monitor" /proc/self/cwd
+    ) || exit 1
     mapfile -t dns < <(awk '$1 == "nameserver" { print $2 }' /etc/resolv.conf)
     (("${#dns[@]}")) || exit 1
     check='
