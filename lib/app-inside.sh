@@ -24,6 +24,27 @@ if [[ -d /run/systemd/resolve ]]; then
     mount -t tmpfs -o size=4k,mode=000 tmpfs /run/systemd/resolve || exit 1
 fi
 
+# Flatpak's runtime may not mount the NixOS timezone file or its store path.
+# Pass a zone identifier so libc and JavaScript resolve it using their own tzdata.
+timezone=
+for setting in "${session[@]}"; do
+    if [[ $setting == TZ=* ]]; then timezone=${setting#TZ=}; break; fi
+done
+if [[ -z $timezone || $timezone == /* || $timezone == :/* ]]; then
+    zonefile=$(readlink -f /etc/localtime) || zonefile=
+    if [[ $zonefile == */zoneinfo/* ]]; then
+        timezone=${zonefile#*/zoneinfo/}
+    elif [[ -r /etc/timezone ]]; then
+        IFS= read -r timezone < /etc/timezone || :
+    fi
+fi
+if [[ $timezone =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]]; then
+    session+=("TZ=$timezone")
+    flatpak_timezone=("--env=TZ=$timezone")
+else
+    flatpak_timezone=()
+fi
+
 if [[ $kind == flatpak ]]; then
     # Pin the desktop user's destination by fd. The private mount namespace and
     # the ownership check keep this bind off system and other users' directories.
@@ -52,15 +73,24 @@ if [[ $kind == flatpak ]]; then
     '
     command=$1
     shift
-    if [[ $forward_files == true ]] && (( $# )); then
+    forwarded=()
+    if [[ $forward_files == true ]]; then
+        for argument; do
+            case "$argument" in
+                @@|@@u) exit 1 ;;
+                file://*) forwarded+=(@@u "$argument" @@) ;;
+                /*) forwarded+=(@@ "$argument" @@) ;;
+                *) forwarded+=("$argument") ;;
+            esac
+        done
         set -- --file-forwarding --command=sh "$app_id" -c "$check" walker-vpn \
-            "$app_iface" "$command" "${dns[@]}" -- @@u "$@" @@
+            "$app_iface" "$command" "${dns[@]}" -- "${forwarded[@]}"
     else
         set -- --command=sh "$app_id" -c "$check" walker-vpn \
             "$app_iface" "$command" "${dns[@]}" -- "$@"
     fi
     set -- "${WALKER_VPN_FLATPAK:-flatpak}" run --share=network --nosocket=session-bus --nosocket=system-bus \
-        --talk-name=org.kde.StatusNotifierWatcher --no-talk-name=org.freedesktop.Flatpak "$@"
+        --talk-name=org.kde.StatusNotifierWatcher --no-talk-name=org.freedesktop.Flatpak "${flatpak_timezone[@]}" "$@"
 else
     set -- /run/current-system/sw/bin/bash "${BASH_SOURCE[0]%/*}/app-session.sh" \
         "$(command -v xdg-dbus-proxy)" "$app_id" "$@"

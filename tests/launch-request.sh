@@ -15,12 +15,12 @@ request=$(jq -nc '{
     mode: "direct", kind: "flatpak", app_id: "org.example.App",
     job: "00000000-0000-0000-0000-000000000000", forward_files: false,
     argv: ["program", "--flag", "", "two words", "first\nsecond\n"],
-    session: {QT_QPA_PLATFORMTHEME:"kde", GTK_PATH:"one\ntwo\n",
+    session: {QT_QPA_PLATFORMTHEME:"kde", TZ:"Etc/GMT+5", GTK_PATH:"one\ntwo\n",
               DBUS_SESSION_BUS_ADDRESS:"unfiltered", QT_PLUGIN_PATH:"bad\u0000value"}
 }')
 mapfile -d '' -t observed < <(launch_app || :)
 expected=(direct flatpak org.example.App false program --flag '' 'two words' $'first\nsecond\n'
-          QT_QPA_PLATFORMTHEME=kde $'GTK_PATH=one\ntwo\n')
+          TZ=Etc/GMT+5 QT_QPA_PLATFORMTHEME=kde $'GTK_PATH=one\ntwo\n')
 [[ ${#observed[@]} == ${#expected[@]} ]]
 for i in "${!expected[@]}"; do [[ ${observed[i]} == "${expected[i]}" ]]; done
 

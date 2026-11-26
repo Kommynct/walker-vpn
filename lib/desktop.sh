@@ -286,8 +286,201 @@ restore_network() {
     mv -f -- "$temporary" "$path"
 }
 
+flatpak_desktop_app() {
+    local exec_line=$1 executable
+    executable=$(desktop_executable "$exec_line") || return 1
+    [[ ${executable##*/} == flatpak ]] || return 1
+    awk '
+        {
+            for (i=1; i<=NF && $i!="run"; i++) {}
+            for (i++; i<=NF; i++) {
+                if ($i ~ /^--/) continue
+                if ($i ~ /^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+){2,}$/) { print $i; found=1 }
+                break
+            }
+        }
+        END { if (!found) exit 1 }
+    ' <<< "$exec_line"
+}
+
+shortcut_owner() {
+    local id=$1 file=$2 line linked ignored canonical
+    line=$(desktop_value "$file" Exec)
+    read -r ignored ignored linked ignored <<< "$line"
+    if desktop_id "$linked" && [[ -f $desktop_root/$linked/shortcuts/$id/generated ]]; then
+        printf '%s\n' "$linked"
+    elif canonical=$(flatpak_desktop_app "${line#"walker-vpn desktop $id -- "}") && desktop_file "$canonical.desktop" >/dev/null; then
+        printf '%s.desktop\n' "$canonical"
+    else
+        printf '%s\n' "$id"
+    fi
+}
+
+refresh_desktop_launchers() {
+    if command -v update-desktop-database >/dev/null; then
+        update-desktop-database "$desktop_data/applications" || :
+    fi
+    # Elephant may also be supervised by the compositor's startup script.
+    if systemctl --user is-active --quiet elephant.service 2>/dev/null; then
+        systemctl --user try-restart elephant.service >/dev/null 2>&1 ||
+            notify 'Elephant could not reload the app list.'
+        return 0
+    fi
+    local pid executable attempt
+    executable=$(type -P elephant) || return 0
+    for pid in $(pgrep -u "$UID" -x 'elephant|[.]elephant-wrapp'); do
+        kill -TERM "$pid" 2>/dev/null || continue
+        for ((attempt=0; attempt<20; attempt++)); do
+            if ! kill -0 "$pid" 2>/dev/null &&
+                pgrep -u "$UID" -x 'elephant|[.]elephant-wrapp' >/dev/null; then return 0; fi
+            sleep .05
+        done
+        systemd-run --user --collect --quiet --unit=walker-vpn-elephant "$executable" >/dev/null 2>&1 ||
+            notify 'Elephant could not reload the app list.'
+        return 0
+    done
+    return 0
+}
+
+render_desktop() {
+    local source=$1 id=$2 kind=$3 sibling=${4:-false}
+    awk -v id="$id" -v kind="$kind" -v sibling="$sibling" '
+        /^\[/ { entry=($0 == "[Desktop Entry]"); action=($0 ~ /^\[Desktop Action /) }
+        entry && /^DBusActivatable=/ { next }
+        (entry || action) && /^Exec=/ {
+            line=substr($0,6)
+            prefix="Exec=walker-vpn desktop " id
+            if (kind=="flatpak") {
+                # Flatpak exports supply an explicit command followed by the app ID.
+                app=id
+                sub(/\.desktop$/, "", app)
+                found=0
+                command=""
+                while (match(line, /^[^[:space:]]+[[:space:]]*/)) {
+                    token=substr(line,1,RLENGTH)
+                    line=substr(line,RLENGTH+1)
+                    sub(/[[:space:]]+$/, "", token)
+                    if (token==app) { found=1; break }
+                    if (token ~ /^--command=[A-Za-z0-9_./][A-Za-z0-9_./+-]*$/) command=substr(token,11)
+                }
+                if (!found) { if (entry) exit 1; next }
+                gsub(/(^|[[:space:]])@@[uU]?([[:space:]]|$)/, " ", line)
+                if ((action || sibling=="true") && command!="") prefix=prefix " --flatpak-command " command
+            }
+            print prefix " -- " line
+            next
+        }
+        entry && /^\[Desktop Entry\]$/ {
+            print; print "DBusActivatable=false"; print "X-Walker-VPN-Managed=true"; next
+        }
+        { print }
+    ' "$source"
+}
+
+replace_launcher() (
+    local source=$1 target=$2 temporary
+    temporary=$(mktemp "${target%/*}/.walker.XXXXXXXX") || return 1
+    trap 'rm -f -- "$temporary"' EXIT
+    cp -- "$source" "$temporary" && mv -f -- "$temporary" "$target"
+)
+
+sync_shortcuts() {
+    local id=$1 source=$2 kind=$3 record=$desktop_root/$1 dir file alias target entry executable other
+    local legacy mode line
+    local PATH=$(unrouted_path)
+    local -A seen=()
+    if [[ $kind == flatpak ]]; then
+        executable=${id%.desktop}
+    else
+        executable=$(desktop_executable "$(desktop_value "$source" Exec)") || return 0
+        can_route_command "${executable##*/}" || return 0
+        executable=$(type -P -- "$executable") || return 0
+    fi
+    mode=$(< "$record/mode")
+    while IFS= read -r dir; do
+        [[ $dir != "$desktop_root/commands" ]] || continue
+        for file in "$dir/"*.desktop; do
+            [[ -f $file ]] || continue
+            alias=${file##*/}
+            [[ $alias != "$id" ]] && desktop_id "$alias" && [[ ! -v seen[$alias] ]] || continue
+            target=$desktop_data/applications/$alias
+            entry=$record/shortcuts/$alias
+            legacy=$desktop_root/$alias
+            [[ ! -e $entry/generated ]] || continue
+            if [[ -f $legacy/mode ]]; then
+                # Older versions could save a distinct native rule for a Flatpak shortcut.
+                [[ $kind == flatpak &&
+                    $(< "$legacy/kind") == native && $(< "$legacy/mode") == "$mode" &&
+                    ! -e $legacy/command-shim ]] || continue
+                if [[ $file == "$target" ]]; then
+                    cmp -s "$file" "$legacy/generated" || continue
+                    [[ -f $legacy/original ]] || continue
+                    file=$legacy/original
+                fi
+            fi
+            seen[$alias]=1
+            line=$(desktop_value "$file" Exec)
+            if [[ $kind == flatpak ]]; then
+                other=$(flatpak_desktop_app "$line") || continue
+                [[ $other == "$executable" ]] || continue
+            else
+                other=$(desktop_executable "$line") || continue
+                other=$(type -P -- "$other") || continue
+                [[ $other -ef $executable ]] || continue
+            fi
+            [[ $(desktop_value "$file" Hidden) != true && $(desktop_value "$file" Terminal) != true ]] || continue
+            mkdir -p "$entry" || return 1
+            if [[ -f $legacy/original ]]; then
+                cp -L -p -- "$legacy/original" "$entry/original" || return 1
+            elif [[ ! -f $legacy/mode && -f $target ]]; then
+                cp -L -p -- "$target" "$entry/original" || return 1
+            fi
+            if ! render_desktop "$file" "$id" "$kind" true > "$entry/generated" ||
+                ! replace_launcher "$entry/generated" "$target"; then
+                rm -rf -- "$entry"
+                return 1
+            fi
+            if [[ -f $legacy/mode ]]; then rm -rf -- "$legacy" || return 1; fi
+        done
+    done < <(desktop_roots)
+}
+
+sync_saved_launchers() (
+    [[ -d $desktop_root && ! -f $desktop_root/.shortcut-format-2 ]] || return 0
+    local lock record id kind dir source target updated
+    exec {lock}>"$desktop_root/.lock"
+    flock "$lock" || return 1
+    [[ ! -f $desktop_root/.shortcut-format-2 ]] || return 0
+    for record in "$desktop_root/"*.desktop; do
+        [[ -f $record/mode && -f $record/kind ]] || continue
+        id=${record##*/}
+        target=$desktop_data/applications/$id
+        [[ -f $target ]] && cmp -s "$record/generated" "$target" || continue
+        kind=$(< "$record/kind")
+        source=$record/original
+        if [[ ! -f $source ]]; then
+            while IFS= read -r dir; do
+                [[ $dir != "$desktop_data/applications" && -f $dir/$id ]] || continue
+                source=$dir/$id
+                break
+            done < <(desktop_roots)
+        fi
+        [[ -f $source ]] || continue
+        updated=$(mktemp "$record/.desktop.XXXXXXXX") || return 1
+        if ! render_desktop "$source" "$id" "$kind" > "$updated" ||
+            ! replace_launcher "$updated" "$target" ||
+            ! mv -f -- "$updated" "$record/generated"; then
+            rm -f -- "$updated"
+            return 1
+        fi
+        sync_shortcuts "$id" "$source" "$kind" || return 1
+    done
+    touch "$desktop_root/.shortcut-format-2" || return 1
+    refresh_desktop_launchers
+)
+
 restore_desktop_files() (
-    local id=$1 record target current kind old
+    local id=$1 record target kind old entry shortcut
     desktop_id "$id" || return 1
     record=$desktop_root/$id
     target=$desktop_data/applications/$id
@@ -299,6 +492,24 @@ restore_desktop_files() (
         notify 'This desktop file was edited. Restore or move it before removing VPN routing.'
         return 1
     fi
+    for entry in "$record/shortcuts/"*; do
+        [[ -f $entry/generated ]] || continue
+        shortcut=$desktop_data/applications/${entry##*/}
+        if [[ -f $shortcut ]] && ! cmp -s "$shortcut" "$entry/generated"; then
+            notify 'A related shortcut was edited. Restore or move it before removing VPN routing.'
+            return 1
+        fi
+    done
+    for entry in "$record/shortcuts/"*; do
+        [[ -f $entry/generated ]] || continue
+        shortcut=$desktop_data/applications/${entry##*/}
+        if [[ -f $entry/original ]]; then
+            replace_launcher "$entry/original" "$shortcut" || return 1
+        else
+            rm -f -- "$shortcut" || return 1
+        fi
+        rm -rf -- "$entry" || return 1
+    done
     if [[ $kind == flatpak && -f $record/network ]]; then
         old=$(< "$record/network")
         if [[ $(flatpak_network "${id%.desktop}") == '!network' ]]; then
@@ -313,7 +524,8 @@ restore_desktop_files() (
     if [[ -s $record/command-shim ]]; then
         rm -f -- "$command_dir/$(< "$record/command-shim")" || return 1
     fi
-    rm -rf -- "$record"
+    rm -rf -- "$record" || return 1
+    refresh_desktop_launchers
 )
 
 restore_desktop() (
@@ -335,11 +547,16 @@ restore_desktop() (
 )
 
 install_desktop() (
-    local id=$1 mode=$2 source kind=native target record command name app_lock desktop_lock shim=
+    local id=$1 mode=$2 source kind=native target record command name owner app_lock desktop_lock shim=
     desktop_id "$id" && [[ $mode == vpn || $mode == direct || $mode == default ]] || return 1
     mkdir -p -- "$desktop_root" "$desktop_data/applications" || return 1
     exec {desktop_lock}>"$desktop_root/.lock"
     flock "$desktop_lock" || return 1
+    source=$(desktop_file "$id") || source=
+    if [[ -n $source ]]; then
+        owner=$(shortcut_owner "$id" "$source") || return 1
+        id=$owner
+    fi
     record=$desktop_root/$id
     if [[ $mode == default && ! -f $record/mode ]]; then return 0; fi
     if [[ -f $record/mode && $(< "$record/mode") == "$mode" ]]; then return 0; fi
@@ -348,7 +565,7 @@ install_desktop() (
     name=$(desktop_value "$source" Name)
     if [[ -f $record/kind ]]; then
         kind=$(< "$record/kind")
-    elif [[ $(desktop_value "$source" Exec) =~ (^|[[:space:]/])flatpak[[:space:]]+run[[:space:]] ]] &&
+    elif [[ $(flatpak_desktop_app "$(desktop_value "$source" Exec)") == "${id%.desktop}" ]] &&
         flatpak info "${id%.desktop}" >/dev/null 2>&1; then
         kind=flatpak
     fi
@@ -367,6 +584,7 @@ install_desktop() (
         local next_mode
         next_mode=$(mktemp "$record/.mode.XXXXXXXX") || return 1
         if printf '%s\n' "$mode" > "$next_mode" && mv -f -- "$next_mode" "$record/mode"; then
+            refresh_desktop_launchers
             return 0
         fi
         rm -f -- "$next_mode"
@@ -395,28 +613,13 @@ install_desktop() (
     if [[ -e $target ]]; then cp -L -p -- "$target" "$record/original" || return 1; fi
     if [[ $kind == flatpak ]]; then
         flatpak_network "${id%.desktop}" > "$record/network"
-        command='%U'
     elif [[ -n $shim ]]; then
         mkdir -p "$command_dir" || return 1
         printf '%s\n' "$shim" > "$record/command-shim" || return 1
         printf '#!/usr/bin/env bash\nexec walker-vpn desktop %q -- %q "$@"\n' \
             "$id" "$shim" > "$command_dir/$shim" && chmod 700 "$command_dir/$shim" || return 1
     fi
-    awk -v id="$id" -v kind="$kind" -v flatpak_exec="$command" '
-        /^\[/ { entry=($0 == "[Desktop Entry]") }
-        /^\[Desktop Action / { action=1 }
-        entry && /^DBusActivatable=/ { next }
-        entry && /^Actions=/ { next }
-        entry && /^Exec=/ {
-            exec_line=(kind=="flatpak" ? flatpak_exec : substr($0,6))
-            print "Exec=walker-vpn desktop " id " -- " exec_line
-            next
-        }
-        entry && /^\[Desktop Entry\]$/ {
-            print; print "DBusActivatable=false"; print "X-Walker-VPN-Managed=true"; next
-        }
-        !action { print }
-    ' "$source" > "$record/generated" || return 1
+    render_desktop "$source" "$id" "$kind" > "$record/generated" || return 1
     temporary=$(mktemp "$desktop_data/applications/.walker.XXXXXXXX") || return 1
     if [[ $kind == flatpak ]] && ! flatpak override --user --unshare=network "${id%.desktop}"; then
         rm -f -- "$temporary"
@@ -428,17 +631,31 @@ install_desktop() (
         return 1
     fi
     trap - EXIT
-    if [[ $target == "$desktop_data/applications/"* ]] && command -v update-desktop-database >/dev/null; then
-        update-desktop-database "$desktop_data/applications" || :
+    if [[ $target == "$desktop_data/applications/"* ]]; then
+        if [[ -f $record/original ]]; then source=$record/original; fi
+        sync_shortcuts "$id" "$source" "$kind" || return 1
+        refresh_desktop_launchers
     fi
 )
 
 desktop_launch() (
-    local id=${1:-} record kind mode source app_lock executable managed_command
-    [[ ${2:-} == -- ]] && desktop_id "$id" || return 2
-    shift 2
+    local id=${1:-} record kind mode source app_lock executable managed_command flatpak_command_override=
+    desktop_id "$id" || return 2
+    shift
+    if [[ ${1:-} == --flatpak-command && ${2:-} =~ ^[a-zA-Z0-9_./][a-zA-Z0-9_./+-]*$ ]]; then
+        flatpak_command_override=$2
+        shift 2
+    fi
+    [[ ${1:-} == -- ]] || return 2
+    shift
     open_app_lock "$id" || return 1
-    flock -n "$app_lock" || return 1
+    local first_launch=false
+    if flock -xn "$app_lock"; then
+        first_launch=true
+    elif ! flock -sn "$app_lock"; then
+        notify 'This app’s network route is being updated. Try again.'
+        return 1
+    fi
     record=$desktop_root/$id
     if [[ ! -f $record/mode || ! -f $record/kind ]]; then
         notify 'Enable the VPN-only policy for this app in Walker before launching it.'
@@ -451,12 +668,18 @@ desktop_launch() (
         return 1
     fi
     source=$(desktop_file "$id") || source=$record/generated
-    if ! app_closed "$id" "$kind" "$source"; then
+    if [[ $first_launch == true ]] && ! app_closed "$id" "$kind" "$source"; then
         notify 'Quit the existing app completely before launching it with VPN routing.'
         return 1
     fi
+    if [[ $first_launch == true ]]; then
+        flock -s "$app_lock" || return 1
+        # A policy update may have acquired the lock during its conversion.
+        [[ -f $record/mode && $(< "$record/mode") == "$mode" &&
+            -f $record/kind && $(< "$record/kind") == "$kind" ]] || return 1
+    fi
     if [[ $kind == flatpak ]]; then
-        if ! executable=$(flatpak_executable "${id%.desktop}"); then
+        if ! executable=${flatpak_command_override:-$(flatpak_executable "${id%.desktop}")}; then
             notify 'Could not read the installed Flatpak’s launch command.'
             return 1
         fi
@@ -518,7 +741,7 @@ command_menu() {
 }
 
 app_menu() {
-    local mode dir file id name pick current
+    local mode dir file id name pick current owner
     local -a ids=() names=() files=()
     local -A seen=()
     local -a managed_ids=() managed_names=()
@@ -532,10 +755,11 @@ app_menu() {
         done
     done < <(desktop_roots)
     if (( ${#files[@]} )); then
-        while IFS=$'\t' read -r id name; do
+        while IFS=$'\t' read -r id name owner; do
             current=
-            if [[ -f $desktop_root/$id/mode ]]; then
-                current=$(< "$desktop_root/$id/mode")
+            if ! desktop_id "$owner" || [[ ! -f $desktop_root/$owner/shortcuts/$id/generated ]]; then owner=$id; fi
+            if [[ -f $desktop_root/$owner/mode ]]; then
+                current=$(< "$desktop_root/$owner/mode")
                 if [[ $current == vpn ]]; then current=' · VPN-only'; else current=' · Excluded'; fi
             fi
             if [[ -n $current ]]; then
@@ -558,7 +782,8 @@ app_menu() {
                     id=FILENAME
                     sub(/^.*\//,"",id)
                     gsub(/[[:cntrl:]]/," ",values["Name"])
-                    print id "\t" values["Name"]
+                    split(values["Exec"], argv, /[[:space:]]+/)
+                    print id "\t" values["Name"] "\t" (argv[1]=="walker-vpn" && argv[2]=="desktop" ? argv[3] : id)
                 }
             }
         ' "${files[@]}")
@@ -571,7 +796,10 @@ app_menu() {
     if (( pick == ${#ids[@]} )); then
         command_menu || result=$?
     else
-        mode=$(choose_app_route "${ids[pick]}" "${names[pick]%% · *}") || return 0
+        local source
+        source=$(desktop_file "${ids[pick]}") || return 1
+        owner=$(shortcut_owner "${ids[pick]}" "$source") || return 1
+        mode=$(choose_app_route "$owner" "${names[pick]%% · *}") || return 0
         install_desktop "${ids[pick]}" "$mode" || result=$?
     fi
     case $result in

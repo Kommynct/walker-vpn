@@ -225,7 +225,8 @@ run_protected() {
 }
 
 case "${1:-menu}" in
-    menu) menu ;;
+    menu) sync_saved_launchers || notify "Could not refresh saved app shortcuts."; menu ;;
+    sync-launchers) sync_saved_launchers ;;
     waybar) waybar ;;
     waybar-watch) watch_waybar ;;
     flatpak) shift; flatpak_command "$@" ;;

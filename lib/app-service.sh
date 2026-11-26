@@ -1,4 +1,12 @@
+app_netns_dir=/run/netns
+
 app_cleanup() {
+    if [[ -n ${active_record:-} && -n ${active_lease:-} ]]; then
+        flock -x "$active_lease" || return 1
+        if [[ -f $active_record && $(< "$active_record") == "$namespace $app_iface $mode $work" ]]; then
+            rm -f -- "$active_record"
+        fi
+    fi
     # Keep the egress policy in place until the host veth is gone.
     if [[ -n ${veth:-} ]]; then
         if ip link show dev "$veth" >/dev/null 2>&1; then
@@ -99,9 +107,9 @@ RULES
 }
 
 launch_app() {
-    local app_kind app_id uid gid home user_entry job forward_files argc
-    mode= namespace= work= veth= pair= vpn_pid=
-    local app_iface= link_index uplink use_host_tunnel=false
+    local app_kind app_id uid gid home user_entry job forward_files argc result=0
+    mode= namespace= work= veth= pair= vpn_pid= active_record= active_lease= app_iface=
+    local link_index uplink use_host_tunnel=false
     local item marker wait_start
     local -a fields=() args=() session=() dns=() options=()
     # NUL-delimited fields preserve spaces, empty arguments, and newlines.
@@ -133,6 +141,23 @@ launch_app() {
     IFS=: read -r _ _ uid gid _ home _ <<< "$user_entry"
     [[ $uid =~ ^[0-9]+$ ]] && (( uid > 0 )) || return 1
     acquire && guard_init || { fail 'The app firewall could not be initialized.'; return; }
+    if [[ -n $app_id ]]; then
+        active_record=$run/active-$app_kind-$app_id
+        if [[ -f $active_record ]]; then
+            local running_mode
+            read -r namespace app_iface running_mode work < "$active_record" || return 1
+            if [[ -e $app_netns_dir/$namespace && -f $work/lease ]]; then
+                [[ $mode == "$running_mode" ]] || { fail 'Close the running app before using a different VPN route.'; return; }
+                exec {active_lease}<"$work/lease" || return 1
+                flock -sn "$active_lease" || { fail 'The app is shutting down. Try opening it again.'; return; }
+                [[ -f $active_record && $(< "$active_record") == "$namespace $app_iface $mode $work" ]] || return 1
+                run_app_in_namespace || result=$?
+                printf '%s\n' "$result" > "$run/result-$job"
+                return "$result"
+            fi
+            rm -f -- "$active_record" || return 1
+        fi
+    fi
     work=$(mktemp -d "$run/app.XXXXXXXX") || return 1
     namespace="wv$(od -An -N5 -tx1 /dev/urandom | tr -d ' \n')"
     trap app_cleanup EXIT
@@ -193,14 +218,46 @@ launch_app() {
         chmod 755 "$work/monitor"
         chmod 444 "$work/monitor/"*
     fi
-    # Bash must retain the EXIT cleanup trap beyond this function's local scope.
-    release
-    ip netns exec "$namespace" bash "$lib/app-inside.sh" "$uid" "$gid" "$account" \
-        "$home" "$namespace" "$app_iface" "$app_kind" "$app_id" "$work" "$forward_files" \
-        "${#session[@]}" "${session[@]}" "${args[@]}"
-    local result=$?
+    if [[ -n $active_record ]]; then
+        exec {active_lease}>"$work/lease" || return 1
+        printf '%s %s %s %s\n' "$namespace" "$app_iface" "$mode" "$work" > "$active_record" || return 1
+    fi
+    run_app_in_namespace || result=$?
+    wait_for_app_processes "$namespace" "$uid"
     trap - EXIT
     app_cleanup
     printf '%s\n' "$result" > "$run/result-$job"
     return "$result"
+}
+
+# Some desktop launchers detach the GUI and exit while it still needs the
+# namespace. Track its members instead of the original launcher's lifetime.
+wait_for_app_processes() {
+    local namespace=$1 uid=$2 members pid key real_uid rest found
+    while members=$(ip netns pids "$namespace"); do
+        found=false
+        for pid in $members; do
+            [[ $pid =~ ^[1-9][0-9]*$ && /proc/$pid/ns/net -ef $app_netns_dir/$namespace ]] || continue
+            while read -r key real_uid rest; do
+                [[ $key == Uid: ]] || continue
+                if [[ $real_uid == "$uid" ]]; then found=true; fi
+                break
+            done 2>/dev/null < "/proc/$pid/status"
+            if [[ $found == true ]]; then break; fi
+        done
+        [[ $found == true ]] || return 0
+        sleep 1
+    done
+}
+
+# A later launch holds a shared lease for as long as it uses the namespace.
+# The creator takes an exclusive lease before removing its firewall or veth.
+run_app_in_namespace() {
+    release
+    (
+        if [[ -n $active_lease ]]; then exec {active_lease}>&-; fi
+        exec ip netns exec "$namespace" bash "$lib/app-inside.sh" "$uid" "$gid" "$account" \
+            "$home" "$namespace" "$app_iface" "$app_kind" "$app_id" "$work" "$forward_files" \
+            "${#session[@]}" "${session[@]}" "${args[@]}"
+    )
 }
