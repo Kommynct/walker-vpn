@@ -97,7 +97,7 @@ if [[ $kind == flatpak ]]; then
         --talk-name=org.kde.StatusNotifierWatcher --no-talk-name=org.freedesktop.Flatpak "${flatpak_timezone[@]}" "$@"
 else
     set -- /run/current-system/sw/bin/bash "${BASH_SOURCE[0]%/*}/app-session.sh" \
-        "$(command -v xdg-dbus-proxy)" "$app_id" "$@"
+        "$(command -v xdg-dbus-proxy)" "$(command -v dbus-run-session)" "$namespace" "$app_id" "$@"
 fi
 
 cd "$home" || exit 1
@@ -105,5 +105,5 @@ printf 'READY\n'
 exec setpriv --reuid="$uid" --regid="$gid" --init-groups --no-new-privs -- \
     env -i HOME="$home" USER="$user" LOGNAME="$user" XDG_RUNTIME_DIR="$runtime" \
     DBUS_SESSION_BUS_ADDRESS="$session_bus" \
-    DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/walker-vpn/no-system-bus \
+    DBUS_SYSTEM_BUS_ADDRESS=unix:path=/dev/null \
     PATH=/run/current-system/sw/bin "${session[@]}" "$@"
