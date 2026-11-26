@@ -25,28 +25,113 @@ unrouted_path() {
 }
 
 flatpak_command() {
-    local argument candidate id
+    local argument candidate id command= cached=false unsupported=false forwarding=false export_command=
+    local arch= branch= current_ref current_id current_arch current_branch
     local real=${WALKER_VPN_FLATPAK:?}
     local -a original=("$@")
+    local -a options=()
     while [[ ${1:-} == -v || ${1:-} == --verbose || ${1:-} == --ostree-verbose ]]; do
         shift
     done
     if [[ ${1:-} == run ]]; then
-        for argument in "${@:2}"; do
+        shift
+        while (( $# )); do
+            argument=$1
+            shift
+            case "$argument" in
+                --arch|--branch|--command)
+                    if (( $# )) && [[ $1 != -* ]]; then
+                        argument+="=$1"
+                        shift
+                    else
+                        unsupported=true
+                        continue
+                    fi
+                    ;;
+            esac
+            case "$argument" in
+                --arch=*)
+                    arch=${argument#*=}
+                    cached=true
+                    continue
+                    ;;
+                --branch=*)
+                    branch=${argument#*=}
+                    cached=true
+                    continue
+                    ;;
+                --command=*)
+                    command=${argument#*=}
+                    continue
+                    ;;
+                --file-forwarding)
+                    forwarding=true
+                    cached=true
+                    continue
+                    ;;
+                --) continue ;;
+                -*) unsupported=true; continue ;;
+            esac
             candidate=${argument#app/}
             candidate=${candidate%%/*}
-            [[ $candidate =~ ^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+){2,}$ ]] || continue
+            if [[ ! $candidate =~ ^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+){2,}$ ]]; then
+                unsupported=true
+                continue
+            fi
             id=$candidate.desktop
             if [[ -f $desktop_root/$id/mode && -f $desktop_root/$id/kind &&
                 $(< "$desktop_root/$id/kind") == flatpak ]]; then
-                if [[ $argument != "$2" || $argument != "$candidate" ]]; then
-                    notify 'Use the managed launcher for this Flatpak with alternate run options.'
+                if [[ $unsupported == true || ( -n $command && ! $command =~ ^[A-Za-z0-9_./][A-Za-z0-9_./+-]*$ ) ]]; then
+                    notify 'Could not apply this Flatpak’s saved route to its launch options.'
                     return 1
                 fi
-                WALKER_VPN_FLATPAK_OPTIONS=true desktop_launch "$id" -- "${@:3}"
+                if [[ $argument != "$candidate" ]]; then
+                    if [[ ${argument#app/} =~ ^[A-Za-z0-9_.-]+/([A-Za-z0-9_-]*)/([A-Za-z0-9_.-]+)$ ]]; then
+                        arch=${BASH_REMATCH[1]}
+                        branch=${BASH_REMATCH[2]}
+                        cached=true
+                    else
+                        notify 'Could not apply this Flatpak’s saved route to that reference.'
+                        return 1
+                    fi
+                fi
+                # Exported desktop commands follow the installed deployment.
+                # An explicit command-line selection must still match it.
+                if [[ $forwarding == false && -z $command && ( -n $arch || -n $branch ) ]]; then
+                    if ! current_ref=$(flatpak info --show-ref "$candidate"); then
+                        notify 'Could not find the Flatpak’s installed deployment.'
+                        return 1
+                    fi
+                    IFS=/ read -r _ current_id current_arch current_branch <<< "$current_ref"
+                    if [[ $current_id != "$candidate" || ( -n $arch && $arch != "$current_arch" ) ||
+                        ( -n $branch && $branch != "$current_branch" ) ]]; then
+                        notify 'The requested Flatpak deployment differs from the one managed by Walker VPN.'
+                        return 1
+                    fi
+                fi
+                if [[ $forwarding == true ]]; then
+                    # Exported launchers may carry an obsolete command after an update.
+                    command=
+                    local -a files=()
+                    for argument; do
+                        case "$argument" in @@|@@u) ;; *) files+=("$argument");; esac
+                    done
+                    set -- "${files[@]}"
+                fi
+                if [[ $cached == true && -n $command && -s $desktop_root/$id/export-command ]]; then
+                    export_command=$(< "$desktop_root/$id/export-command")
+                    if [[ $command == "$export_command" ]]; then command=; fi
+                fi
+                if [[ -n $command ]]; then options=(--flatpak-command "$command"); fi
+                if [[ $forwarding == false ]]; then
+                    WALKER_VPN_REFRESH_EXPORT=$cached WALKER_VPN_FLATPAK_OPTIONS=true \
+                        desktop_launch "$id" "${options[@]}" -- "$@"
+                else
+                    WALKER_VPN_REFRESH_EXPORT=$cached desktop_launch "$id" "${options[@]}" -- "$@"
+                fi
                 return
             fi
-            break
+            if [[ $unsupported == false ]]; then break; fi
         done
     fi
     exec "$real" "${original[@]}"
@@ -211,13 +296,30 @@ flatpak_network() {
 }
 
 flatpak_executable() {
-    local metadata
-    metadata=$(flatpak info --show-metadata "$1") || return 1
+    local metadata attempt
+    for attempt in 1 2 3; do
+        if metadata=$(flatpak info --show-metadata "$1" 2>/dev/null); then break; fi
+        if (( attempt == 3 )); then return 1; fi
+        sleep .25
+    done
     awk '
         /^\[/ { app=($0=="[Application]") }
         app && /^command=./ { print substr($0,9); found=1; exit }
         END { if (!found) exit 1 }
     ' <<< "$metadata"
+}
+
+prepare_flatpak_session() {
+    local attempt
+    for attempt in 1 2; do
+        if gdbus call --session --timeout=3 --dest org.freedesktop.Flatpak \
+            --object-path /org/freedesktop/Flatpak/SessionHelper \
+            --method org.freedesktop.Flatpak.SessionHelper.RequestSession >/dev/null 2>&1; then
+            return 0
+        fi
+        if (( attempt == 1 )); then sleep .25; fi
+    done
+    return 1
 }
 
 restore_network() {
@@ -287,6 +389,69 @@ replace_launcher() (
     temporary=$(mktemp "${target%/*}/.walker.XXXXXXXX") || return 1
     trap 'rm -f -- "$temporary"' EXIT
     cp -- "$source" "$temporary" && mv -f -- "$temporary" "$target"
+)
+
+flatpak_export_desktop() {
+    local file
+    for file in "$desktop_data/flatpak/exports/share/applications/$1" \
+                "/var/lib/flatpak/exports/share/applications/$1"; do
+        if [[ -f $file ]]; then printf '%s\n' "$file"; return 0; fi
+    done
+    return 1
+}
+
+refresh_flatpak_entry() {
+    local desktop=$1 owner=$2 record=$3 sibling=$4 source target rendered
+    source=$(flatpak_export_desktop "$desktop") || return 0
+    target=$desktop_data/applications/$desktop
+    if [[ -f $target ]] && ! cmp -s "$target" "$record/generated" && ! cmp -s "$target" "$source"; then
+        # Keep edits to the user's launcher separate from an upstream refresh.
+        return 0
+    fi
+    if [[ -f $record/original ]]; then source=$record/original; fi
+    rendered=$(mktemp "$record/.launcher.XXXXXXXX") || return 1
+    if render_desktop "$source" "$owner" flatpak "$sibling" > "$rendered" &&
+        replace_launcher "$rendered" "$target" && mv -f -- "$rendered" "$record/generated"; then
+        return 0
+    fi
+    rm -f -- "$rendered"
+    return 1
+}
+
+repair_flatpak_export() (
+    local id=$1 record=$desktop_root/$1 export_file stamp edit shortcut exec_line
+    local refresh_cache=${WALKER_VPN_REFRESH_EXPORT:-false}
+    export_file=$(flatpak_export_desktop "$id") || return 0
+    stamp=$(stat -Lc '%d:%i:%s:%y' "$export_file") || return 1
+    if [[ -f $record/cache-stamp && $(< "$record/cache-stamp") == "$stamp" ]]; then refresh_cache=false; fi
+    if [[ -f $record/export-stamp && $(< "$record/export-stamp") == "$stamp" &&
+        -f $desktop_data/applications/$id && $refresh_cache == false ]]; then
+        return 0
+    fi
+    exec {edit}>"$desktop_root/.lock"
+    flock -w 5 "$edit" || return 1
+    [[ -f $record/mode && -f $record/kind && $(< "$record/kind") == flatpak ]] || return 0
+    if [[ ! -f $record/export-stamp || $(< "$record/export-stamp") != "$stamp" ||
+        ! -f $desktop_data/applications/$id ]]; then
+        mkdir -p -- "$desktop_data/applications" || return 1
+        flatpak override --user --unshare=network "${id%.desktop}" || return 1
+        refresh_flatpak_entry "$id" "$id" "$record" false || return 1
+        for shortcut in "$record/shortcuts/"*.desktop; do
+            [[ -f $shortcut/generated ]] || continue
+            refresh_flatpak_entry "${shortcut##*/}" "$id" "$shortcut" true || return 1
+        done
+        exec_line=$(desktop_value "$export_file" Exec)
+        if [[ $exec_line =~ [[:space:]]--command=([A-Za-z0-9_./+-]+) ]]; then
+            printf '%s\n' "${BASH_REMATCH[1]}" > "$record/export-command" || return 1
+        fi
+        printf '%s\n' "$stamp" > "$record/export-stamp" || return 1
+    elif [[ $refresh_cache == false ||
+        ( -f $record/cache-stamp && $(< "$record/cache-stamp") == "$stamp" ) ]]; then
+        return 0
+    fi
+    refresh_desktop_launchers
+    if [[ $refresh_cache == true ]]; then printf '%s\n' "$stamp" > "$record/cache-stamp"; fi
+    return 0
 )
 
 sync_shortcuts() {
@@ -577,6 +742,11 @@ desktop_launch() (
     fi
     [[ ${1:-} == -- ]] || return 2
     shift
+    record=$desktop_root/$id
+    if [[ -f $record/kind && $(< "$record/kind") == flatpak ]] && ! repair_flatpak_export "$id"; then
+        notify 'Could not refresh the Flatpak launcher while keeping its saved route.'
+        return 1
+    fi
     open_app_lock "$id" || return 1
     local first_launch=false
     if flock -xn "$app_lock"; then
@@ -612,9 +782,7 @@ desktop_launch() (
             notify 'Could not read the installed Flatpak’s launch command.'
             return 1
         fi
-        gdbus call --session --dest org.freedesktop.Flatpak \
-            --object-path /org/freedesktop/Flatpak/SessionHelper \
-            --method org.freedesktop.Flatpak.SessionHelper.RequestSession >/dev/null ||
+        prepare_flatpak_session ||
             { notify 'Flatpak could not initialize its DNS monitor.'; return 1; }
         run_protected "$mode" flatpak "${id%.desktop}" "$executable" "$@" </dev/null ||
             { notify 'Could not launch the Flatpak with its network policy.'; return 1; }
