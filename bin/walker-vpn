@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+set -uo pipefail
+umask 077
+socket=/run/walker-vpn.sock
+view=/run/walker-vpn-view
+root_dir=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/..
+source "$root_dir/lib/desktop.sh"
+source "$root_dir/lib/session-env.sh"
+
+call() {
+    local response wait=${1:-115}
+    [[ -S $socket ]] || { printf 'The walker-vpn systemd socket is unavailable.\n' >&2; return 1; }
+    response=$(socat -t "$wait" -T "$((wait + 2))" - "UNIX-CONNECT:$socket") || return 1
+    if jq -e '.error' <<< "$response" >/dev/null 2>&1; then
+        jq -r '.error' <<< "$response" >&2
+        return 1
+    fi
+    jq -ec . <<< "$response"
+}
+
+request() {
+    local wait=115
+    if [[ $1 == status ]]; then wait=2; fi
+    jq -nc --arg action "$1" --arg region "${2:-}" '{$action,$region}' | call "$wait"
+}
+
+read_status() {
+    if [[ -S $socket && -s $view/status.json ]]; then
+        printf '%s\n' "$(< "$view/status.json")"
+    else
+        request status
+    fi
+}
+
+choose() {
+    local prompt=$1
+    shift
+    printf '%s\n' "$@" | walker --dmenu --index --placeholder "$prompt"
+}
+
+notify() { notify-send -a 'Walker VPN' 'Walker VPN' "$*" || printf '%s\n' "$*" >&2; }
+
+perform() {
+    local message
+    if ! message=$(request "$@" 2>&1); then notify "$message"; return 1; fi
+}
+
+first_setup() {
+    local provider username password error
+    provider=$(choose 'VPN provider' 'Private Internet Access (PIA)') || return 1
+    [[ $provider == 0 ]] || return 1
+    username=$(walker --dmenu --inputonly --placeholder 'PIA VPN username (p…) ' </dev/null) || return 1
+    [[ $username =~ ^p[0-9]{1,20}$ ]] || { notify 'Enter the PIA VPN username beginning with p.'; return 1; }
+    password=$(walker --password --inputonly --placeholder 'PIA VPN password' </dev/null) || return 1
+    [[ -n $password ]] || return 1
+    if ! error=$(
+        printf '%s\n%s\n' "$username" "$password" |
+            jq -ncR 'input as $username | input as $password |
+                {action:"login",provider:"pia",$username,$password}' |
+            call 2>&1
+    ); then
+        notify "$error"
+        return 1
+    fi
+    notify 'PIA login verified and saved.'
+}
+
+format_waybar() {
+    local status=$1 connection kill region label
+    if [[ -z $status ]]; then
+        jq -nc '{text:"󰖂",tooltip:"VPN setup unavailable",class:"unavailable"}'
+        return
+    fi
+    IFS=$'\t' read -r connection kill region < <(jq -r '[.connection,.kill,.region] | @tsv' <<< "$status")
+    case "$connection" in
+        connected) label=Connected ;;
+        connecting|reconnecting) label=${connection^} ;;
+        *) label=Disconnected ;;
+    esac
+    if [[ $kill == degraded ]]; then label+=' · Kill switch needs attention'; fi
+    jq -nc --arg tip "VPN · $label${region:+ · $region}
+Kill switch: $kill" --arg connection "$connection" --arg kill "$kill" \
+        '{text:"󰖂",tooltip:$tip,class:[$connection,("kill-" + $kill)]}'
+}
+
+waybar() {
+    local status
+    status=$(read_status 2>/dev/null) || status=
+    format_waybar "$status"
+}
+
+watch_waybar() {
+    local latest previous=unset events watcher
+    [[ -d $view ]] || { format_waybar ''; return 1; }
+    coproc STATUS_EVENTS { exec inotifywait -q -m -e moved_to --format '%f' "$view"; }
+    watcher=$STATUS_EVENTS_PID
+    exec {events}<&"${STATUS_EVENTS[0]}"
+    trap 'kill "$watcher" 2>/dev/null || :' EXIT
+    trap 'exit 0' HUP INT TERM
+    while :; do
+        latest=
+        if [[ -S $socket && -s $view/status.json ]]; then latest=$(< "$view/status.json"); fi
+        if [[ $latest != "$previous" ]]; then
+            format_waybar "$latest" || exit 1
+            previous=$latest
+        fi
+        IFS= read -r -t 8 -u "$events" || (( $? > 128 )) || exit 1
+    done
+}
+
+select_region() {
+    local catalog pick id id_name
+    local -a labels=('Optimal · fastest reachable location') ids=(optimal)
+    if [[ -s $view/locations.json ]]; then
+        catalog=$(< "$view/locations.json")
+    elif ! catalog=$(request locations 2>&1); then
+        notify "$catalog"
+        return 1
+    fi
+    while IFS=$'\t' read -r id id_name; do
+        ids+=("$id")
+        labels+=("$id_name")
+    done < <(jq -r '.[] | [.id, (.name + " · " + .country)] | @tsv' <<< "$catalog")
+    pick=$(choose 'Connect to PIA' "${labels[@]}") || return 1
+    [[ $pick =~ ^(0|[1-9][0-9]{0,4})$ ]] && (( pick < ${#ids[@]} )) || return 1
+    perform connect "${ids[pick]}"
+}
+
+menu() {
+    local status pick last login kill region
+    local -a labels commands
+    if ! status=$(read_status 2>&1); then notify "$status"; return 1; fi
+    IFS=$'\t' read -r last login kill region < <(
+        jq -r '[.connection,.login,.kill,.region] | @tsv' <<< "$status"
+    )
+    if [[ $last != disconnected ]]; then
+        labels+=('Disconnect and restore regular internet' 'Change VPN location…')
+        commands+=(disconnect connect)
+    elif [[ $login == true ]]; then
+        labels+=('Connect to VPN…')
+        commands+=(connect)
+    else
+        labels+=('Set up VPN…')
+        commands+=(setup)
+    fi
+    if [[ $last == disconnected && $kill != off ]]; then
+        labels+=('Disconnect and restore regular internet')
+        commands+=(disconnect)
+    fi
+    labels+=('App routing…')
+    commands+=(apps)
+    if [[ $kill == off ]]; then
+        labels+=('Turn on kill switch')
+        commands+=(kill-on)
+    else
+        labels+=('Turn off kill switch')
+        commands+=(kill-off)
+    fi
+    labels+=('VPN settings…')
+    commands+=(settings)
+    pick=$(choose "${last^}${region:+ · $region} · Kill switch $kill" "${labels[@]}") || return 0
+    [[ $pick =~ ^[0-9]{1,2}$ ]] && (( 10#$pick < ${#commands[@]} )) || return 1
+    local action=${commands[10#$pick]}
+    if [[ $action == settings ]]; then
+        labels=('Refresh locations')
+        commands=(refresh)
+        if [[ $login == true ]]; then
+            labels+=('Change VPN login…' 'Forget VPN login…')
+            commands+=(login forget)
+        fi
+        pick=$(choose 'VPN settings' "${labels[@]}") || return 0
+        [[ $pick =~ ^[0-2]$ && -n ${commands[pick]:-} ]] || return 1
+        action=${commands[pick]}
+    fi
+    case "$action" in
+        setup) first_setup && select_region ;;
+        login) first_setup ;;
+        connect) select_region ;;
+        apps) app_menu ;;
+        kill-on)
+            local confirm
+            confirm=$(choose 'The kill switch can pause internet access' 'Cancel' 'Enable') || return 0
+            [[ $confirm == 1 ]] && perform "$action"
+            ;;
+        forget)
+            local confirm
+            confirm=$(choose 'Remove the saved VPN login?' 'Cancel' 'Forget login') || return 0
+            [[ $confirm == 1 ]] && perform forget
+            ;;
+        *) perform "$action" ;;
+    esac
+}
+
+run_protected() {
+    local mode=$1 kind=$2 id=$3 header key marker job code
+    local PATH=$PATH
+    PATH=$(unrouted_path)
+    shift 3
+    [[ $mode == vpn || $mode == direct ]] || return 2
+    [[ -S $socket ]] || { printf 'The walker-vpn service is unavailable.\n' >&2; return 1; }
+    job=$(< /proc/sys/kernel/random/uuid)
+    header=$(
+        for key in "${app_session_keys[@]}"; do
+            if [[ -v $key ]]; then printf '%s\0%s\0' "$key" "${!key}"; fi
+        done | jq -Rsc --arg mode "$mode" --arg kind "$kind" --arg id "$id" --arg job "$job" '
+            split("\u0000") as $entries |
+            (reduce range(0; ($entries | length); 2) as $n
+                ({}; .[$entries[$n]] = $entries[$n+1])) as $session |
+            {action:"app",$mode,$kind,app_id:$id,$job,$session,argv:$ARGS.positional,
+                forward_files:($ENV.WALKER_VPN_FLATPAK_OPTIONS != "true")}' --args -- "$@"
+    ) || return 1
+    {
+        printf '%s\n' "$header"
+        cat
+    } | socat -t 2147483 - "UNIX-CONNECT:$socket" | {
+        IFS= read -r marker && [[ $marker == READY ]] || {
+            printf 'The app could not start in its VPN namespace. Check journalctl -u "walker-vpn@*.service".\n' >&2
+            return 1
+        }
+        cat
+    } || return 1
+    code=$(jq -nc --arg job "$job" '{action:"app-result",$job}' | call) || return 1
+    [[ $code =~ ^[0-9]{1,3}$ ]] && (( code <= 255 )) || return 1
+    return "$code"
+}
+
+case "${1:-menu}" in
+    menu) menu ;;
+    waybar) waybar ;;
+    waybar-watch) watch_waybar ;;
+    flatpak) shift; flatpak_command "$@" ;;
+    status) request status ;;
+    disconnect|kill-off|kill-preview|kill-on) request "$1" ;;
+    run)
+        [[ $# -ge 4 && $3 == -- ]] || { printf 'Usage: walker-vpn run vpn|direct -- COMMAND [ARG…]\n' >&2; exit 2; }
+        mode=$2; shift 3
+        run_protected "$mode" native '' "$@"
+        ;;
+    desktop|require-vpn|autostart)
+        required_mode=
+        if [[ $1 == require-vpn ]]; then required_mode=vpn; fi
+        if [[ $1 == autostart ]]; then export WALKER_VPN_FLATPAK_OPTIONS=true; fi
+        shift
+        desktop_launch "$@"
+        ;;
+    restore)
+        shift
+        if [[ ${1:-} == --all ]]; then
+            restore_all
+        else
+            [[ $# == 1 ]] && restore_desktop "$1"
+        fi
+        ;;
+    *) printf 'Usage: walker-vpn [menu|status|disconnect|kill-off|run|restore]\n' >&2; exit 2 ;;
+esac

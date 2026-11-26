@@ -1,0 +1,24 @@
+#custom-vpn {
+    min-width: 20px;
+    margin: 0 2px;
+}
+
+#custom-vpn.connected {
+    color: #83c99b;
+}
+
+#custom-vpn.disconnected {
+    color: #999999;
+}
+
+#custom-vpn.connecting,
+#custom-vpn.reconnecting {
+    color: #e7b669;
+}
+
+#custom-vpn.kill-on.disconnected,
+#custom-vpn.kill-on.reconnecting,
+#custom-vpn.kill-degraded,
+#custom-vpn.unavailable {
+    color: #f06565;
+}

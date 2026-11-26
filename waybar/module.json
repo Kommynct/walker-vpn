@@ -1,0 +1,9 @@
+{
+  "custom/vpn": {
+    "exec": "walker-vpn waybar-watch",
+    "return-type": "json",
+    "restart-interval": 2,
+    "on-click": "walker-vpn menu",
+    "tooltip": true
+  }
+}
