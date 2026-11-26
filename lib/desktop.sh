@@ -144,7 +144,7 @@ open_app_lock() {
 }
 
 close_app_before_change() {
-    local id=$1 kind=$2 source=$3 name=$4 reply running windows pid address
+    local id=$1 kind=$2 source=$3 name=$4 reopen_flag=${5:-} reply running windows pid address
     local deadline=0 requested_windows=false locked
     local -A signaled=()
     while :; do
@@ -155,12 +155,15 @@ close_app_before_change() {
             return 2
         }
         if [[ $locked == true ]]; then
-            if [[ -z $running ]]; then return 0; fi
+            if [[ -z $running ]]; then
+                if (( deadline != 0 )) && [[ -n $reopen_flag ]]; then printf -v "$reopen_flag" true; fi
+                return 0
+            fi
             flock -u "$app_lock" || return 1
         fi
         if (( deadline == 0 )); then
-            reply=$(choose "Close $name and change its VPN routing? Save your work first" \
-                'Close app and apply' 'Cancel') || return 2
+            reply=$(choose "Reopen $name with its new VPN route? Save your work first" \
+                'Close and reopen app' 'Cancel') || return 2
             [[ $reply == 0 ]] || return 2
             deadline=$(( SECONDS + 15 ))
             continue
@@ -450,8 +453,24 @@ restore_desktop() (
     restore_desktop_files "$id"
 )
 
+reopen_routed_app() {
+    local selected=$1 id=$2 mode=$3 launcher
+    if [[ $mode != default && -f $desktop_root/$id/launcher ]]; then
+        launcher=$desktop_root/$id/launcher
+    else
+        launcher=$(desktop_file "$selected") || launcher=$(desktop_file "$id") || launcher=
+    fi
+    # The desktop launcher calls back into Walker VPN and needs the app lock.
+    exec {app_lock}>&- {desktop_lock}>&-
+    if [[ -z $launcher ]] || ! gio launch "$launcher"; then
+        notify 'VPN routing changed, but the app could not be reopened.'
+    fi
+    return 0
+}
+
 install_desktop() (
     local id=$1 mode=$2 source kind=native target record command name owner app_lock desktop_lock shim=
+    local selected=$id reopen=false
     desktop_id "$id" && [[ $mode == vpn || $mode == direct || $mode == default ]] || return 1
     mkdir -p -- "$desktop_root" "$desktop_data/applications" || return 1
     exec {desktop_lock}>"$desktop_root/.lock"
@@ -474,9 +493,13 @@ install_desktop() (
         kind=flatpak
     fi
     open_app_lock "$id" || return 1
-    close_app_before_change "$id" "$kind" "$source" "${name:-${id%.desktop}}" || return $?
+    close_app_before_change "$id" "$kind" "$source" "${name:-${id%.desktop}}" reopen || return $?
     if [[ -f $record/mode ]]; then
-        if [[ $mode == default ]]; then restore_desktop_files "$id"; return; fi
+        if [[ $mode == default ]]; then
+            restore_desktop_files "$id" || return 1
+            if [[ $reopen == true ]]; then reopen_routed_app "$selected" "$id" "$mode"; fi
+            return 0
+        fi
         if [[ -e $desktop_root/commands/$id ]]; then source=$record/launcher; fi
         if ! cmp -s "$source" "$record/generated"; then
             notify 'The managed launcher changed. Restore it before switching routing.'
@@ -489,6 +512,7 @@ install_desktop() (
         next_mode=$(mktemp "$record/.mode.XXXXXXXX") || return 1
         if printf '%s\n' "$mode" > "$next_mode" && mv -f -- "$next_mode" "$record/mode"; then
             refresh_desktop_launchers
+            if [[ $reopen == true ]]; then reopen_routed_app "$selected" "$id" "$mode"; fi
             return 0
         fi
         rm -f -- "$next_mode"
@@ -540,6 +564,7 @@ install_desktop() (
         sync_shortcuts "$id" "$source" "$kind" || return 1
         refresh_desktop_launchers
     fi
+    if [[ $reopen == true ]]; then reopen_routed_app "$selected" "$id" "$mode"; fi
 )
 
 desktop_launch() (

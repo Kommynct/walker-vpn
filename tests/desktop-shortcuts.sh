@@ -23,9 +23,26 @@ Name=New Window
 Exec=example-client --new-window %U
 ENTRY
 printf '[Desktop Entry]\nName=Example Settings\nExec=example-client --settings\n' > "$XDG_DATA_DIRS/applications/$settings"
-close_app_before_change() { return 0; }
-app_closed() { return 0; }
+app_processes() {
+    if [[ -f $scratch/running ]]; then printf '9999999\n'; fi
+}
+choose() {
+    [[ $2 == 'Close and reopen app' && $3 == Cancel ]]
+    if [[ -f $scratch/cancel ]]; then printf '1\n'; return; fi
+    rm "$scratch/running"
+    printf '0\n'
+}
+gio() {
+    [[ $1 == launch && -f $2 ]]
+    flock -xn "$desktop_root/locks/$id" true
+    flock -xn "$desktop_root/.lock" true
+    printf '%s\n' "$2" >> "$scratch/reopened"
+}
 refresh_desktop_launchers() { printf 'refresh\n' >> "$scratch/refresh"; }
+touch "$scratch/running" "$scratch/cancel"
+if install_desktop "$id" vpn; then exit 1; fi
+[[ ! -e $scratch/reopened && ! -e $desktop_root/$id/mode ]]
+rm "$scratch/cancel"
 install_desktop "$id" vpn
 main=$desktop_data/applications/$id
 alternate=$desktop_data/applications/$settings
@@ -33,11 +50,19 @@ rg -Fxq "Exec=walker-vpn desktop $id -- example-client %U" "$main"
 rg -Fxq "Exec=walker-vpn desktop $id -- example-client --new-window %U" "$main"
 rg -Fxq 'MimeType=x-scheme-handler/magnet;' "$main"
 rg -Fxq "Exec=walker-vpn desktop $id -- example-client --settings" "$alternate"
+touch "$scratch/running"
 install_desktop "$settings" direct
 [[ $(< "$desktop_root/$id/mode") == direct && ! -e $desktop_root/$settings/mode ]]
+touch "$scratch/running"
 install_desktop "$settings" default
 [[ ! -e $main && ! -e $alternate ]]
 [[ $(wc -l < "$scratch/refresh") == 3 ]]
+mapfile -t reopened < "$scratch/reopened"
+[[ ${#reopened[@]} == 3 ]]
+[[ ${reopened[0]} == "$main" && ${reopened[1]} == "$alternate" &&
+    ${reopened[2]} == "$XDG_DATA_DIRS/applications/$settings" ]]
+printf 'Route changes reopen the selected launcher after releasing locks. Cancel leaves it alone.\n'
+
 cat > "$scratch/flatpak" <<'ENTRY'
 [Desktop Entry]
 Exec=/usr/bin/flatpak run --branch=stable --command=example --file-forwarding org.example.Client @@u %U @@
