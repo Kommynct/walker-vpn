@@ -96,6 +96,16 @@ if [[ $kind == flatpak ]]; then
     set -- "${WALKER_VPN_FLATPAK:-flatpak}" run --share=network --nosocket=session-bus --nosocket=system-bus \
         --talk-name=org.kde.StatusNotifierWatcher --no-talk-name=org.freedesktop.Flatpak "${flatpak_timezone[@]}" "$@"
 else
+    if [[ -x ${WALKER_VPN_LINK_OPENER:-} ]]; then
+        # Some applications use the desktop opener's absolute path.
+        # This bind is visible only in the app's private mount namespace.
+        mount --bind "$WALKER_VPN_LINK_OPENER" "$WALKER_VPN_DESKTOP_OPENER" || exit 1
+        user_path=/run/current-system/sw/bin
+        for setting in "${session[@]}"; do
+            if [[ $setting == PATH=* ]]; then user_path=${setting#PATH=}; break; fi
+        done
+        session+=("PATH=${WALKER_VPN_LINK_OPENER%/*}:$user_path" "BROWSER=$WALKER_VPN_LINK_OPENER")
+    fi
     set -- /run/current-system/sw/bin/bash "${BASH_SOURCE[0]%/*}/app-session.sh" \
         "$(command -v xdg-dbus-proxy)" "$(command -v dbus-run-session)" "$namespace" "$app_id" "$@"
 fi

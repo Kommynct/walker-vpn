@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -uo pipefail
+export LC_ALL=C
+
+web_url() {
+    [[ ${#1} -le 8192 && $1 =~ ^https?://[^[:space:][:cntrl:]]+$ ]]
+}
+
+case $1 in
+    client)
+        opener=$2 transport=$3
+        shift 3
+        if [[ $# == 1 && ( $1 == http://* || $1 == https://* ) ]]; then
+            web_url "$1" || exit 2
+            socket=$XDG_RUNTIME_DIR/walker-vpn-links.sock
+            [[ -S $socket ]] || { echo 'The desktop link opener is unavailable.' >&2; exit 1; }
+            response=$(printf '%s\n' "$1" | "$transport" -t 12 -T 14 - "UNIX-CONNECT:$socket") || exit 1
+            [[ $response == ok ]] || { echo 'The desktop could not open the link.' >&2; exit 1; }
+        else
+            unset BROWSER
+            exec "$opener" "$@"
+        fi
+        ;;
+    serve)
+        IFS= read -r -n 8193 -t 5 url || exit 2
+        web_url "$url" || exit 2
+        if "$2" open "$url" </dev/null >/dev/null 2>&1; then
+            printf 'ok\n'
+        else
+            printf 'error\n'
+            exit 1
+        fi
+        ;;
+    *) exit 2 ;;
+esac

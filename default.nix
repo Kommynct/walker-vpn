@@ -2,6 +2,14 @@
 
 let
   cfg = config.services.walker-vpn;
+  desktopOpener = lib.getExe' pkgs.xdg-utils "xdg-open";
+  unwrappedOpener = pkgs.runCommand "walker-vpn-unwrapped-xdg-open" { } ''
+    install -Dm755 ${desktopOpener} "$out/bin/xdg-open"
+  '';
+  linkHandler = pkgs.writeShellScript "walker-vpn-link-handler" (builtins.readFile ./bin/open-link);
+  linkOpener = pkgs.writeShellScriptBin "xdg-open" ''
+    exec ${linkHandler} client ${unwrappedOpener}/bin/xdg-open ${lib.getExe' pkgs.socat "socat"} "$@"
+  '';
   client = pkgs.runCommand "walker-vpn-client" {
     nativeBuildInputs = [ pkgs.makeWrapper ];
   } ''
@@ -53,6 +61,8 @@ let
       SSL_CERT_FILE = "/etc/ssl/certs/ca-bundle.crt";
       RUST_LOG = "info";
       WALKER_VPN_FLATPAK = lib.getExe pkgs.flatpak;
+      WALKER_VPN_LINK_OPENER = lib.getExe' linkOpener "xdg-open";
+      WALKER_VPN_DESKTOP_OPENER = desktopOpener;
     };
     serviceConfig = {
       UMask = "0077";
@@ -118,6 +128,35 @@ in {
         SocketUser = cfg.user;
         MaxConnections = 32;
         RemoveOnStop = true;
+      };
+    };
+
+    systemd.user.sockets.walker-vpn-links = {
+      description = "Open web links in the desktop session";
+      wantedBy = [ "sockets.target" ];
+      socketConfig = {
+        ListenStream = "%t/walker-vpn-links.sock";
+        SocketMode = "0600";
+        Accept = true;
+        MaxConnections = 16;
+      };
+    };
+
+    systemd.user.services."walker-vpn-links@" = {
+      description = "Open a routed app’s web link";
+      # Desktop entries can name executables from the system or user profile.
+      environment.PATH = lib.mkForce (lib.concatStringsSep ":" [
+        "/run/wrappers/bin"
+        "%h/.nix-profile/bin"
+        "%h/.local/state/nix/profile/bin"
+        "/etc/profiles/per-user/%u/bin"
+        "/run/current-system/sw/bin"
+      ]);
+      serviceConfig = {
+        ExecStart = "${linkHandler} serve ${lib.getExe' pkgs.glib "gio"}";
+        StandardInput = "socket";
+        StandardOutput = "inherit";
+        ExitType = "cgroup";
       };
     };
 
