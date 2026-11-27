@@ -766,7 +766,7 @@ install_desktop() (
 )
 
 launch_desktop_protected() (
-    local kind=$2 launch_error_file failure attempt
+    local launch_error_file failure attempt
     launch_error_file=$(mktemp) || return 1
     trap 'rm -f -- "$launch_error_file"' EXIT
     for attempt in 1 2 3 4; do
@@ -779,11 +779,7 @@ launch_desktop_protected() (
     case $failure in
         'ERROR '*) notify "${failure#ERROR }" ;;
         RETRY) notify 'The app is still shutting down. Try opening it again when it has closed.' ;;
-        *) if [[ $kind == flatpak ]]; then
-               notify 'Could not launch the Flatpak with its network policy.'
-           else
-               notify 'Could not launch the application with its network policy.'
-           fi ;;
+        *) notify 'Could not launch the application with its network policy.' ;;
     esac
     return 1
 )

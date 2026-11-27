@@ -240,9 +240,9 @@ run_protected() {
                 return 1
                 ;;
             *)
-            printf 'The app could not start in its VPN namespace. Check journalctl -u "walker-vpn@*.service".\n' >&2
-            return 1
-            ;;
+                printf 'The app could not start in its VPN namespace. Check journalctl -u "walker-vpn@*.service".\n' >&2
+                return 1
+                ;;
         esac
         cat
     } || return 1
