@@ -22,3 +22,18 @@ install_desktop "$id" direct
 [[ $(< "$record/mode") == direct ]]
 cmp "$launcher" "$record/generated"
 printf 'Failed and successful mode changes preserve the managed launcher.\n'
+
+choose_app_route() { printf 'vpn\n'; }
+choose_vpn_region() {
+    [[ $1 == 'Test · VPN location' && $2 == "$expected_region" ]]
+    printf '%s\n' "$next_region"
+}
+expected_region=host next_region=example-region
+configure_app_route "$id" "$id" Test
+[[ $(< "$record/mode") == vpn && $(< "$record/region") == example-region ]]
+flatpak() { return 1; }
+expected_region=example-region next_region=host
+configure_app_route "$id" "$id" Test
+[[ $(< "$record/region") == host ]]
+cmp "$launcher" "$record/generated"
+printf 'The menu saves a VPN location and can restore the system location without rewriting the launcher.\n'

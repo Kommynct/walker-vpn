@@ -633,10 +633,18 @@ reopen_routed_app() {
     return 0
 }
 
+save_app_region() (
+    local record=$1 region=$2 next
+    next=$(mktemp "$record/.region.XXXXXXXX") || return 1
+    trap 'rm -f -- "$next"' EXIT
+    printf '%s\n' "$region" > "$next" && mv -fT -- "$next" "$record/region"
+)
+
 install_desktop() (
     local id=$1 mode=$2 source kind=native target record command name owner app_lock desktop_lock shim=
-    local selected=$id reopen=false
-    desktop_id "$id" && [[ $mode == vpn || $mode == direct || $mode == default ]] || return 1
+    local selected=$id reopen=false region=${3:-host} previous_region=host
+    desktop_id "$id" && [[ $mode == vpn || $mode == direct || $mode == default ]] &&
+        [[ $region =~ ^[a-zA-Z0-9_-]{1,64}$ ]] || return 1
     mkdir -p -- "$desktop_root" "$desktop_data/applications" || return 1
     exec {desktop_lock}>"$desktop_root/.lock"
     flock "$desktop_lock" || return 1
@@ -647,7 +655,9 @@ install_desktop() (
     fi
     record=$desktop_root/$id
     if [[ $mode == default && ! -f $record/mode ]]; then return 0; fi
-    if [[ -f $record/mode && $(< "$record/mode") == "$mode" ]]; then return 0; fi
+    if [[ -f $record/region ]]; then previous_region=$(< "$record/region"); fi
+    if [[ -f $record/mode && $(< "$record/mode") == "$mode" &&
+        ( $mode != vpn || $region == "$previous_region" ) ]]; then return 0; fi
     target=$desktop_data/applications/$id
     source=$(desktop_file "$id") || { [[ -f $record/generated ]] && source=$record/generated; } || return 1
     name=$(desktop_value "$source" Name)
@@ -665,6 +675,11 @@ install_desktop() (
             if [[ $reopen == true ]]; then reopen_routed_app "$selected" "$id" "$mode"; fi
             return 0
         fi
+        if [[ $mode == vpn && $(< "$record/mode") == vpn ]]; then
+            save_app_region "$record" "$region" || return 1
+            if [[ $reopen == true ]]; then reopen_routed_app "$selected" "$id" "$mode"; fi
+            return 0
+        fi
         if [[ -e $desktop_root/commands/$id ]]; then source=$record/launcher; fi
         if ! cmp -s "$source" "$record/generated"; then
             notify 'The managed launcher changed. Restore it before switching routing.'
@@ -673,6 +688,7 @@ install_desktop() (
         if [[ $kind == flatpak ]]; then
             flatpak override --user --unshare=network "${id%.desktop}" || return 1
         fi
+        if [[ $mode == vpn ]]; then save_app_region "$record" "$region" || return 1; fi
         local next_mode
         next_mode=$(mktemp "$record/.mode.XXXXXXXX") || return 1
         if printf '%s\n' "$mode" > "$next_mode" && mv -f -- "$next_mode" "$record/mode"; then
@@ -703,6 +719,7 @@ install_desktop() (
     trap 'if [[ -n $shim ]]; then rm -f -- "$command_dir/$shim"; fi; rm -rf -- "$record"' EXIT
     printf '%s\n' "$kind" > "$record/kind"
     printf '%s\n' "$mode" > "$record/mode"
+    if [[ $mode == vpn ]]; then save_app_region "$record" "$region" || return 1; fi
     if [[ -e $target ]]; then cp -L -p -- "$target" "$record/original" || return 1; fi
     if [[ $kind == flatpak ]]; then
         flatpak_network "${id%.desktop}" > "$record/network"
@@ -733,7 +750,7 @@ install_desktop() (
 )
 
 desktop_launch() (
-    local id=${1:-} record kind mode source app_lock executable managed_command flatpak_command_override=
+    local id=${1:-} record kind mode source app_lock executable managed_command flatpak_command_override= app_region=host
     desktop_id "$id" || return 2
     shift
     if [[ ${1:-} == --flatpak-command && ${2:-} =~ ^[a-zA-Z0-9_./][a-zA-Z0-9_./+-]*$ ]]; then
@@ -777,6 +794,7 @@ desktop_launch() (
         [[ -f $record/mode && $(< "$record/mode") == "$mode" &&
             -f $record/kind && $(< "$record/kind") == "$kind" ]] || return 1
     fi
+    if [[ $mode == vpn && -f $record/region ]]; then app_region=$(< "$record/region"); fi
     if [[ $kind == flatpak ]]; then
         if ! executable=${flatpak_command_override:-$(flatpak_executable "${id%.desktop}")}; then
             notify 'Could not read the installed Flatpak’s launch command.'
@@ -813,8 +831,25 @@ choose_app_route() {
     printf '%s\n' "${modes[pick]}"
 }
 
+configure_app_route() {
+    local selected=$1 owner=$2 name=$3 command_only=${4:-false} mode region=host
+    mode=$(choose_app_route "$owner" "$name") || return 2
+    if [[ $mode == vpn ]]; then
+        if [[ -f $desktop_root/$owner/region ]]; then region=$(< "$desktop_root/$owner/region"); fi
+        region=$(choose_vpn_region "$name · VPN location" "${region:-host}") || return 2
+    fi
+    if [[ $command_only == true && $mode != default ]]; then
+        local file=$desktop_root/commands/$selected
+        mkdir -p "$desktop_root/commands" || return 1
+        if [[ ! -e $file ]]; then
+            printf '[Desktop Entry]\nName=%s\nType=Application\nExec=%s\n' "$name" "$name" > "$file" || return 1
+        fi
+    fi
+    install_desktop "$selected" "$mode" "$region"
+}
+
 command_menu() {
-    local mode path command id file picked
+    local path command id picked
     local -a commands=()
     for path in /run/current-system/sw/bin/*; do
         command=${path##*/}
@@ -826,19 +861,11 @@ command_menu() {
     [[ $picked =~ ^(0|[1-9][0-9]{0,5})$ ]] && (( picked < ${#commands[@]} )) || return 2
     command=${commands[picked]}
     id=walker-vpn-command.$command.desktop
-    mode=$(choose_app_route "$id" "$command") || return 2
-    [[ $mode != default || -f $desktop_root/$id/mode ]] || return 0
-    # A launcher for command-only packages is internal to Walker VPN.
-    mkdir -p "$desktop_root/commands" || return 1
-    file=$desktop_root/commands/$id
-    if [[ ! -e $file ]]; then
-        printf '[Desktop Entry]\nName=%s\nType=Application\nExec=%s\n' "$command" "$command" > "$file" || return 1
-    fi
-    install_desktop "$id" "$mode"
+    configure_app_route "$id" "$id" "$command" true
 }
 
 app_menu() {
-    local mode dir file id name pick current owner
+    local dir file id name pick current owner
     local -a ids=() names=() files=()
     local -A seen=()
     local -a managed_ids=() managed_names=()
@@ -896,8 +923,7 @@ app_menu() {
         local source
         source=$(desktop_file "${ids[pick]}") || return 1
         owner=$(shortcut_owner "${ids[pick]}" "$source") || return 1
-        mode=$(choose_app_route "$owner" "${names[pick]%% · *}") || return 0
-        install_desktop "${ids[pick]}" "$mode" || result=$?
+        configure_app_route "${ids[pick]}" "$owner" "${names[pick]%% · *}" || result=$?
     fi
     case $result in
         0|2) return 0 ;;

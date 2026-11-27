@@ -105,6 +105,7 @@ RULES
             printf 'add element inet walkervpn direct { %s }\n' "$pair" | nft -f - || return 1
         done
     fi
+    guard_app_peers || return 1
     rules=$(ip -j -4 rule show) || return 1
     # Select the uplink source address at socket connect time. The nftables
     # route hook marks the approved connection for return-path filtering.
@@ -126,6 +127,29 @@ RULES
     if [[ -e $run/armed ]] && ! guard_armed; then
         guard_set on || return 1
     fi
+}
+
+guard_app_peers() {
+    nft list set inet walkervpn app_peers >/dev/null 2>&1 && return 0
+    # This transaction also upgrades a running installation without flushing its guard.
+    nft -f - <<RULES || return 1
+add set inet walkervpn app_peers { type inet_service . ipv4_addr . inet_service; }
+insert rule inet walkervpn block_output meta mark $wgmark udp sport . ip daddr . udp dport @app_peers accept
+insert rule inet walkervpn remember_transport meta mark $wgmark udp sport . ip daddr . udp dport @app_peers ct mark set meta mark
+RULES
+    local record namespace port address endpoint live_endpoint
+    for record in "$run"/app-peer-wv*; do
+        [[ -f $record ]] || continue
+        namespace=${record##*/app-peer-}
+        [[ $namespace =~ ^wv[0-9a-f]{10}$ && -e /run/netns/$namespace ]] || continue
+        read -r port address endpoint < "$record" || continue
+        valid_port "$port" && ipv4 "$address" && valid_port "$endpoint" || continue
+        [[ $(nsenter --net="/run/netns/$namespace" wg show "$namespace" listen-port 2>/dev/null) == "$port" ]] || continue
+        read -r _ live_endpoint < <(nsenter --net="/run/netns/$namespace" wg show "$namespace" endpoints 2>/dev/null) || continue
+        [[ $live_endpoint == "$address:$endpoint" ]] || continue
+        printf 'add element inet walkervpn app_peers { %s . %s . %s }\n' "$port" "$address" "$endpoint" |
+            nft -f - || return 1
+    done
 }
 
 guard_armed() {

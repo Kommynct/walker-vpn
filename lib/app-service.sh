@@ -1,11 +1,29 @@
 app_netns_dir=/run/netns
+app_netns_config=/etc/netns
 
 app_cleanup() {
     if [[ -n ${active_record:-} && -n ${active_lease:-} ]]; then
         flock -x "$active_lease" || return 1
-        if [[ -f $active_record && $(< "$active_record") == "$namespace $app_iface $mode $work" ]]; then
+        if [[ -f $active_record && $(< "$active_record") == "$namespace $app_iface $mode $work $region" ]]; then
             rm -f -- "$active_record"
         fi
+    fi
+    if [[ -n ${app_peer:-} ]]; then
+        rm -f -- "$run/app-peer-$namespace"
+        printf 'delete element inet walkervpn app_peers { %s }\n' "$app_peer" | nft -f - >&2 || :
+    fi
+    if [[ ${owns_wireguard:-false} == true ]]; then
+        local -a netns=()
+        if [[ ${wireguard_moved:-false} == true ]]; then netns=(-n "$namespace"); fi
+        if ip "${netns[@]}" link show dev "$app_iface" >/dev/null 2>&1; then
+            ip "${netns[@]}" link del "$app_iface" >&2 || return 1
+        fi
+    fi
+    if [[ ${owns_netns:-false} == true && -e $app_netns_dir/$namespace ]]; then
+        ip netns del "$namespace" >&2 || return 1
+    fi
+    if [[ ${owns_netns_dns:-false} == true ]]; then
+        rm -rf -- "$app_netns_config/$namespace"
     fi
     # Keep the egress policy in place until the host veth is gone.
     if [[ -n ${veth:-} ]]; then
@@ -37,18 +55,74 @@ app_cleanup() {
     rm -rf -- "$work"
 }
 
+start_app_tunnel() {
+    local wanted=$1 config=$work/wvapp.conf address endpoint peer_ip peer_port port
+    local -a profile_fields=() dns=()
+    build_profile "$wanted" "$config" >/dev/null || return 1
+    mapfile -t profile_fields < <(awk '
+        $1 == "Address" { address=$3 }
+        $1 == "Endpoint" { endpoint=$3 }
+        $1 == "DNS" { for (i=3; i<=NF; i++) { sub(/,$/, "", $i); dns=dns "nameserver " $i "\n" } }
+        END { if (address && endpoint && dns) printf "%s\n%s\n%s", address, endpoint, dns }
+    ' "$config")
+    (( ${#profile_fields[@]} >= 3 )) || return 1
+    address=${profile_fields[0]} endpoint=${profile_fields[1]} dns=("${profile_fields[@]:2}")
+    peer_ip=${endpoint%:*} peer_port=${endpoint##*:}
+    ipv4 "$peer_ip" && valid_port "$peer_port" || return 1
+
+    ip netns add "$namespace" || return 1
+    owns_netns=true
+    mkdir -p -m755 "$app_netns_config" || return 1
+    mkdir -m755 -- "$app_netns_config/$namespace" || return 1
+    owns_netns_dns=true
+    printf '%s\n' "${dns[@]}" > "$app_netns_config/$namespace/resolv.conf" || return 1
+    chmod 644 "$app_netns_config/$namespace/resolv.conf" || return 1
+    ip -n "$namespace" link set lo up || return 1
+    # WireGuard retains its UDP socket in the namespace where it was created.
+    # The app sees only loopback and WireGuard, with no physical veth to use.
+    ip link add "$namespace" type wireguard || return 1
+    owns_wireguard=true
+    app_iface=$namespace
+    ip link set "$app_iface" netns "$namespace" || return 1
+    wireguard_moved=true
+    ip -n "$namespace" address add "$address" dev "$app_iface" &&
+        ip -n "$namespace" link set "$app_iface" mtu 1420 up || return 1
+    port=$(nsenter --net="$app_netns_dir/$namespace" wg show "$app_iface" listen-port) && valid_port "$port" || return 1
+    app_peer="$port . $peer_ip . $peer_port"
+    printf '%s %s %s\n' "$port" "$peer_ip" "$peer_port" > "$run/app-peer-$namespace" || return 1
+    printf 'add element inet walkervpn app_peers { %s }\n' "$app_peer" | nft -f - || return 1
+    wg-quick strip "$config" |
+        awk -v port="$port" -v mark="$wgmark" '
+            /^\[Interface\]$/ { print; print "ListenPort = " port; print "FwMark = " mark; next }
+            { print }
+        ' > "$work/wireguard.conf" || return 1
+    nsenter --net="$app_netns_dir/$namespace" wg setconf "$app_iface" "$work/wireguard.conf" &&
+        rm -f -- "$config" "$work/wireguard.conf" &&
+        ip -4 -n "$namespace" route add default dev "$app_iface" || return 1
+    nsenter --net="$app_netns_dir/$namespace" nft -f - <<RULES
+table inet walker_app {
+    chain output {
+        type filter hook output priority -20; policy drop;
+        oifname "lo" accept
+        meta nfproto ipv4 oifname "$app_iface" accept
+    }
+}
+RULES
+}
+
 app_policy() {
-    local links inside wgdev uplink_index endpoint peer_ip peer_port mark allowed reverse_mark=
+    local links inside uplink_index app_address reverse_mark=
     local route_table=main
-    links=$(ip -n "$namespace" -j -d link show | jq -er '
+    links=$(ip -n "$namespace" -j -d address show | jq -er '
         [.[] | select(.linkinfo.info_kind == "veth")] as $interfaces |
-        [.[] | select(.linkinfo.info_kind == "wireguard")] as $tunnels |
         select(($interfaces | length) == 1) |
-        [$interfaces[0].ifname, $interfaces[0].link_index,
-            (if ($tunnels | length) == 1 then $tunnels[0].ifname else "" end)] | @tsv
+        $interfaces[0] |
+        [.addr_info[] | select(.family == "inet") | .local] as $addresses |
+        select(($addresses | length) == 1) |
+        [.ifname, .link_index, $addresses[0]] | @tsv
     ') || return 1
-    IFS=$'\t' read -r inside link_index wgdev <<< "$links"
-    [[ $link_index =~ ^[0-9]+$ ]] || return 1
+    IFS=$'\t' read -r inside link_index app_address <<< "$links"
+    [[ $link_index =~ ^[0-9]+$ ]] && ipv4 "$app_address" || return 1
     links=$(ip -j -d link show | jq -er --argjson index "$link_index" --arg uplink "$uplink" '
         [first(.[] | select(.ifindex == $index and .linkinfo.info_kind == "veth") | .ifname),
          first(.[] | select(.ifname == $uplink) | .ifindex)] |
@@ -56,31 +130,18 @@ app_policy() {
     ') || return 1
     IFS=$'\t' read -r veth uplink_index <<< "$links"
     valid_interface "$inside" && valid_interface "$veth" && valid_interface "$uplink" || return 1
-
-    if [[ $mode == direct || ${use_host_tunnel:-false} == true ]]; then
-        allowed="meta nfproto ipv4 oifname \"$inside\" accept"
-        app_iface=$inside
-        if [[ $mode == direct ]]; then
-            reverse_mark="iifname \"$veth\" oifname \"$uplink\" meta nfproto ipv4 ct mark set $bootstrap_mark"
-        fi
+    app_iface=$inside
+    if [[ $mode == direct ]]; then
+        reverse_mark="iifname \"$veth\" oifname \"$uplink\" meta nfproto ipv4 ct mark set $bootstrap_mark"
     else
-        valid_interface "$wgdev" || return 1
-        endpoint=$(ip netns exec "$namespace" wg show "$wgdev" endpoints | awk 'NR == 1 { print $2 }')
-        peer_ip=${endpoint%:*}
-        peer_port=${endpoint##*:}
-        mark=$(ip netns exec "$namespace" wg show "$wgdev" fwmark) || return 1
-        valid_interface "$wgdev" && ipv4 "$peer_ip" && valid_port "$peer_port" &&
-            [[ $mark =~ ^0x[1-9a-f][a-f0-9]{0,7}$ ]] || return 1
-        allowed=$(printf 'meta nfproto ipv4 oifname "%s" accept\noifname "%s" meta mark %s ip daddr %s udp dport %s accept' \
-            "$wgdev" "$inside" "$mark" "$peer_ip" "$peer_port")
-        app_iface=$wgdev
+        route_table=$wgmark
     fi
     ip netns exec "$namespace" nft -f - <<RULES >&2 || return 1
 table inet walker_app {
     chain output {
         type filter hook output priority -20; policy drop;
         oifname "lo" accept
-        $allowed
+        meta nfproto ipv4 oifname "$inside" accept
     }
 }
 RULES
@@ -98,17 +159,18 @@ table inet $namespace {
         oifname "$veth" iifname != "$uplink" drop
         $reverse_mark
     }
+    chain postrouting {
+        type nat hook postrouting priority srcnat - 1; policy accept;
+        iifname "$veth" oifname "$uplink" ip saddr $app_address masquerade
+    }
 }
 RULES
-    if [[ $mode == direct || $use_host_tunnel == true ]]; then
-        # Stop route lookup if the selected table has no route. This remains
-        # in force if a firewall reload removes the host-side nftables policy.
-        if [[ $use_host_tunnel == true ]]; then route_table=$wgmark; fi
-        ip -4 rule add pref "$app_deny_pref" iif "$veth" prohibit >&2 || return 1
-        app_route_denied=true
-        ip -4 rule add pref "$app_route_pref" iif "$veth" lookup "$route_table" >&2 || return 1
-        app_route_table=$route_table
-    fi
+    # Stop route lookup if the selected table has no route even during a
+    # host firewall reload.
+    ip -4 rule add pref "$app_deny_pref" iif "$veth" prohibit >&2 || return 1
+    app_route_denied=true
+    ip -4 rule add pref "$app_route_pref" iif "$veth" lookup "$route_table" >&2 || return 1
+    app_route_table=$route_table
     if [[ $mode == direct ]]; then
         [[ $uplink_index =~ ^[0-9]+$ ]] || return 1
         local indices="$link_index . $uplink_index"
@@ -118,19 +180,53 @@ RULES
     fi
 }
 
+start_forwarded_app() {
+    local link_index uplink item marker wait_start
+    local -a dns=() options=()
+    if [[ $mode == direct ]]; then
+        uplink=$(physical_link) || { fail 'No active physical IPv4 link was found.'; return; }
+    else
+        uplink=$iface
+        tunnel_is_up || { fail 'The host VPN tunnel is unavailable.'; return; }
+    fi
+    mapfile -t dns < <(link_dns "$uplink")
+    (("${#dns[@]}")) || { fail 'The selected uplink has no IPv4 DNS servers.'; return; }
+    for item in "${dns[@]}"; do options+=(--dns "$item"); done
+    : > "$work/vopono.toml" || return 1
+    (
+        exec {lock}>&-
+        exec vopono exec "${options[@]}" --provider none --protocol none --firewall nftables --disable-ipv6 \
+            --vopono-config "$work/vopono.toml" --custom-netns-name "$namespace" \
+            --interface "$uplink" --no-proxy --create-netns-only none
+    ) </dev/null >"$work/vopono.log" 2>&1 &
+    vpn_pid=$!
+    marker="Created netns $namespace -"
+    wait_start=$SECONDS
+    until rg -q -F "$marker" "$work/vopono.log"; do
+        if ! kill -0 "$vpn_pid" 2>/dev/null || (( SECONDS - wait_start >= 22 )); then
+            fail 'Vopono did not start the app namespace.'
+            return
+        fi
+        sleep 0.1
+    done
+    app_policy || fail 'Could not install the app isolation policy.'
+}
+
 launch_app() {
     local app_kind app_id uid gid home user_entry job forward_files argc result=0
-    mode= namespace= work= veth= pair= vpn_pid= active_record= active_lease= app_iface=
+    mode= region= namespace= work= veth= pair= vpn_pid= active_record= active_lease= app_iface=
+    owns_netns=false owns_netns_dns=false owns_wireguard=false wireguard_moved=false app_peer=
     app_route_table= app_route_denied=false
-    local link_index uplink use_host_tunnel=false
-    local item marker wait_start
-    local -a fields=() args=() session=() dns=() options=()
+    local item
+    local -a fields=() args=() session=()
     # NUL-delimited fields preserve spaces, empty arguments, and newlines.
     mapfile -d '' -t fields < <(jq -s -j --args '
         def safe_string: type == "string" and length <= 4096 and index("\u0000") == null;
         select(length == 1) | .[0] |
         select(
             (.mode == "vpn" or .mode == "direct") and
+            ((.region // "host") | strings | test("^[A-Za-z0-9_-]{1,64}$")) and
+            (.mode == "vpn" or (.region // "host") == "host") and
             (.kind == "native" or .kind == "flatpak") and
             (.job | strings | test("^[a-f0-9-]{36}$")) and
             ((.app_id // "") | strings | test("^[A-Za-z0-9_.-]{0,200}$")) and
@@ -138,18 +234,19 @@ launch_app() {
             (.argv | type == "array" and length >= 1 and length <= 80 and all(.[]; safe_string))
         ) |
         (if (.session | type) == "object" then .session else {} end) as $env |
-        ([.mode, .kind, (.app_id // ""), .job, (.forward_files != false | tostring), (.argv | length | tostring)] +
+        ([.mode, .kind, (.app_id // ""), .job, (.forward_files != false | tostring), (.argv | length | tostring), (.region // "host")] +
             .argv + [$ARGS.positional[] as $key | $env[$key] | select(safe_string) | "\($key)=\(.)"])[] |
         ., "\u0000"
     ' -- "${app_session_keys[@]}" <<< "$request")
-    if (( ${#fields[@]} < 7 )); then
+    if (( ${#fields[@]} < 8 )); then
         fail 'The app request contained invalid launch information.'
         return
     fi
     mode=${fields[0]} app_kind=${fields[1]} app_id=${fields[2]}
     job=${fields[3]} forward_files=${fields[4]} argc=${fields[5]}
-    args=("${fields[@]:6:argc}")
-    session=("${fields[@]:6+argc}")
+    region=${fields[6]}
+    args=("${fields[@]:7:argc}")
+    session=("${fields[@]:7+argc}")
     user_entry=$(getent passwd "$account") || { fail 'The desktop account could not be found.'; return; }
     IFS=: read -r _ _ uid gid _ home _ <<< "$user_entry"
     [[ $uid =~ ^[0-9]+$ ]] && (( uid > 0 )) || return 1
@@ -157,13 +254,15 @@ launch_app() {
     if [[ -n $app_id ]]; then
         active_record=$run/active-$app_kind-$app_id
         if [[ -f $active_record ]]; then
-            local running_mode
-            read -r namespace app_iface running_mode work < "$active_record" || return 1
+            local running_mode running_region registered
+            registered=$(< "$active_record")
+            read -r namespace app_iface running_mode work running_region <<< "$registered" || return 1
             if [[ -e $app_netns_dir/$namespace && -f $work/lease ]]; then
-                [[ $mode == "$running_mode" ]] || { fail 'Close the running app before using a different VPN route.'; return; }
+                [[ $mode == "$running_mode" && $region == "${running_region:-host}" ]] ||
+                    { fail 'Close the running app before using a different VPN route.'; return; }
                 exec {active_lease}<"$work/lease" || return 1
                 flock -sn "$active_lease" || { fail 'The app is shutting down. Try opening it again.'; return; }
-                [[ -f $active_record && $(< "$active_record") == "$namespace $app_iface $mode $work" ]] || return 1
+                [[ -f $active_record && $(< "$active_record") == "$registered" ]] || return 1
                 run_app_in_namespace || result=$?
                 printf '%s\n' "$result" > "$run/result-$job"
                 return "$result"
@@ -175,65 +274,28 @@ launch_app() {
     namespace="wv$(od -An -N5 -tx1 /dev/urandom | tr -d ' \n')"
     trap app_cleanup EXIT
     trap 'exit 143' TERM HUP INT
-    : > "$work/vopono.toml"
-
-    if [[ $mode == direct ]] || tunnel_exists; then
-        if [[ $mode == direct ]]; then
-            uplink=$(physical_link) || { fail 'No active physical IPv4 link was found.'; return; }
-        else
-            uplink=$iface
-            use_host_tunnel=true
-            if ! tunnel_is_up; then
-                fail 'The host VPN tunnel is unavailable.'
-                return
-            fi
-        fi
-        mapfile -t dns < <(link_dns "$uplink")
-        (("${#dns[@]}")) || { fail 'The selected uplink has no IPv4 DNS servers.'; return; }
-        options=(--provider none --protocol none)
-        for item in "${dns[@]}"; do options+=(--dns "$item"); done
+    if [[ $mode == direct ]] || { [[ $region == host ]] && tunnel_exists; }; then
+        start_forwarded_app || return 1
+    elif [[ $region != host ]]; then
+        start_app_tunnel "$region" || { fail 'Could not connect to the app’s selected VPN location.'; return; }
+    elif guard_armed || [[ -e $run/armed ]]; then
+        fail 'Connect the host VPN or select a VPN location for this app while the kill switch is on.'
+        return
     else
-        if guard_armed || [[ -e $run/armed ]]; then
-            fail 'Connect the host VPN before starting a VPN-only app while the kill switch is on.'
-            return
-        else
-            uplink=$(physical_link) || { fail 'No active physical IPv4 link was found.'; return; }
-        fi
-        build_profile optimal "$work/walker.conf" >/dev/null ||
-            { fail 'Could not register a WireGuard peer for this app.'; return; }
-        options=(--provider custom --protocol wireguard --custom "$work/walker.conf")
+        start_app_tunnel optimal || { fail 'Could not register a WireGuard peer for this app.'; return; }
     fi
-    # A child must never inherit the advisory lock after setup.
-    (
-        exec {lock}>&-
-        exec vopono exec "${options[@]}" --firewall nftables --disable-ipv6 \
-            --vopono-config "$work/vopono.toml" --custom-netns-name "$namespace" \
-            --interface "$uplink" --no-proxy --create-netns-only none
-    ) </dev/null >"$work/vopono.log" 2>&1 &
-    vpn_pid=$!
-    marker="Created netns $namespace -"
-    wait_start=$SECONDS
-    until rg -q -F "$marker" "$work/vopono.log"; do
-        if ! kill -0 "$vpn_pid" 2>/dev/null || (( SECONDS - wait_start >= 22 )); then
-            # Backend diagnostics may contain provider or tunnel details.
-            fail 'Vopono did not start the app namespace.'
-            return
-        fi
-        sleep 0.1
-    done
-    app_policy || { fail 'Could not install the app isolation policy.'; return; }
     if [[ $app_kind == flatpak ]]; then
         mkdir "$work/monitor" || return 1
         for item in host.conf gai.conf hosts; do
             if [[ -f /etc/$item ]]; then cp "/etc/$item" "$work/monitor/$item" || return 1; fi
         done
-        cp "/etc/netns/$namespace/resolv.conf" "$work/monitor/resolv.conf" || return 1
+        cp "$app_netns_config/$namespace/resolv.conf" "$work/monitor/resolv.conf" || return 1
         chmod 755 "$work/monitor"
         chmod 444 "$work/monitor/"*
     fi
     if [[ -n $active_record ]]; then
         exec {active_lease}>"$work/lease" || return 1
-        printf '%s %s %s %s\n' "$namespace" "$app_iface" "$mode" "$work" > "$active_record" || return 1
+        printf '%s %s %s %s %s\n' "$namespace" "$app_iface" "$mode" "$work" "$region" > "$active_record" || return 1
     fi
     run_app_in_namespace || result=$?
     wait_for_app_processes "$namespace" "$uid"
@@ -246,7 +308,7 @@ launch_app() {
 # Some desktop launchers detach the GUI and exit while it still needs the
 # namespace. Track its members instead of the original launcher's lifetime.
 wait_for_app_processes() {
-    local namespace=$1 uid=$2 members pid key real_uid rest live_pid
+    local namespace=$1 uid=$2 members pid key real_uid rest live_pid waiter
     while members=$(ip netns pids "$namespace"); do
         live_pid=
         for pid in $members; do
@@ -259,10 +321,12 @@ wait_for_app_processes() {
             [[ -z $live_pid ]] || break
         done
         [[ -n $live_pid ]] || return 0
-        # Keep watching the same process until another namespace scan is needed.
-        while [[ /proc/$live_pid/ns/net -ef $app_netns_dir/$namespace ]]; do
+        # A pidfd wakes the supervisor on exit without polling a detached app.
+        pidwait -U "$uid" -F - <<< "$live_pid" >/dev/null 2>&1 &
+        waiter=$!
+        if ! wait "$waiter" && [[ /proc/$live_pid/ns/net -ef $app_netns_dir/$namespace ]]; then
             sleep 1
-        done
+        fi
     done
 }
 

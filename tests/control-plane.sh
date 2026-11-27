@@ -48,7 +48,7 @@ guard_armed
     ip() {
         case "$1 $2" in
             '-n wv0123456789')
-                printf '%s\n' '[{"ifname":"inside","link_index":7,"linkinfo":{"info_kind":"veth"}}]' ;;
+                printf '%s\n' '[{"ifname":"inside","link_index":7,"linkinfo":{"info_kind":"veth"},"addr_info":[{"family":"inet","local":"192.0.2.2"}]}]' ;;
             '-j -d')
                 printf '%s\n' '[{"ifname":"outside","ifindex":7,"linkinfo":{"info_kind":"veth"}},{"ifname":"tunnel","ifindex":8}]' ;;
             'netns exec') cat >/dev/null ;;

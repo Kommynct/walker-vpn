@@ -41,23 +41,23 @@ request=$(jq -nc --arg magnet "$magnet" '{
 rm "$scratch/delivered"
 if (request=$(jq '.mode="direct"' <<< "$request"); launch_app); then exit 1; fi
 [[ ! -e $scratch/delivered ]]
-printf 'A second launch delivered the full magnet URI in the existing VPN namespace. A mismatched route was rejected.\n'
+if (request=$(jq '.region="example-region"' <<< "$request"); launch_app); then exit 1; fi
+[[ ! -e $scratch/delivered ]]
+printf '%s %s %s %s %s\n' "$namespace" private0 vpn "$work" example-region > "$run/active-native-org.example.Client"
+if (launch_app); then exit 1; fi
+[[ ! -e $scratch/delivered ]]
+(request=$(jq '.region="example-region"' <<< "$request"); launch_app)
+[[ $(< "$scratch/delivered") == "$magnet" ]]
+printf 'A second launch preserved the magnet URI. Mismatched app modes and locations were rejected.\n'
 
 # The initiating command has exited, but a detached app process is still live.
 rm -f "$app_netns_dir/$namespace"
 ln -s /proc/self/ns/net "$app_netns_dir/$namespace"
-bash -c 'exec sleep 30' &
+sleep .5 &
 detached=$!
 trap 'kill "$detached" 2>/dev/null || :; rm -rf "$scratch"' EXIT
 ip() { echo scan >> "$scratch/scans"; printf '%s\n' "$detached"; }
-polls=0
-sleep() {
-    polls=$((polls + 1))
-    [[ $polls == 3 ]] || return 0
-    kill "$detached"
-    wait "$detached" 2>/dev/null || :
-    touch "$scratch/kept-alive"
-}
 wait_for_app_processes "$namespace" "$UID"
-[[ -f $scratch/kept-alive && $(wc -l < "$scratch/scans") == 2 ]]
+wait "$detached"
+[[ $(wc -l < "$scratch/scans") == 2 ]]
 printf 'Detached apps keep the protected namespace alive until the last process exits.\n'

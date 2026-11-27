@@ -107,9 +107,13 @@ watch_waybar() {
     done
 }
 
-select_region() {
-    local catalog pick id id_name
+choose_vpn_region() {
+    local prompt=$1 current=${2:-} catalog pick id id_name i
     local -a labels=('Optimal · fastest reachable location') ids=(optimal)
+    if [[ -n $current ]]; then
+        labels=('Follow the system VPN location' "${labels[@]}")
+        ids=(host "${ids[@]}")
+    fi
     if [[ -s $view/locations.json ]]; then
         catalog=$(< "$view/locations.json")
     elif ! catalog=$(request locations 2>&1); then
@@ -120,9 +124,18 @@ select_region() {
         ids+=("$id")
         labels+=("$id_name")
     done < <(jq -r '.[] | [.id, (.name + " · " + .country)] | @tsv' <<< "$catalog")
-    pick=$(choose 'Connect to PIA' "${labels[@]}") || return 1
+    for i in "${!ids[@]}"; do
+        if [[ ${ids[i]} == "$current" ]]; then labels[i]+=' · Current'; fi
+    done
+    pick=$(choose "$prompt" "${labels[@]}") || return 1
     [[ $pick =~ ^(0|[1-9][0-9]{0,4})$ ]] && (( pick < ${#ids[@]} )) || return 1
-    perform connect "${ids[pick]}"
+    printf '%s\n' "${ids[pick]}"
+}
+
+select_region() {
+    local region
+    region=$(choose_vpn_region 'Connect to PIA') || return 1
+    perform connect "$region"
 }
 
 menu() {
@@ -201,11 +214,12 @@ run_protected() {
     header=$(
         for key in "${app_session_keys[@]}"; do
             if [[ -v $key ]]; then printf '%s\0%s\0' "$key" "${!key}"; fi
-        done | jq -Rsc --arg mode "$mode" --arg kind "$kind" --arg id "$id" --arg job "$job" '
+        done | jq -Rsc --arg mode "$mode" --arg kind "$kind" --arg id "$id" --arg job "$job" \
+            --arg region "${app_region:-host}" '
             split("\u0000") as $entries |
             (reduce range(0; ($entries | length); 2) as $n
                 ({}; .[$entries[$n]] = $entries[$n+1])) as $session |
-            {action:"app",$mode,$kind,app_id:$id,$job,$session,argv:$ARGS.positional,
+            {action:"app",$mode,$kind,app_id:$id,$job,$session,$region,argv:$ARGS.positional,
                 forward_files:($ENV.WALKER_VPN_FLATPAK_OPTIONS != "true")}' --args -- "$@"
     ) || return 1
     {
@@ -233,7 +247,8 @@ case "${1:-menu}" in
     disconnect|kill-off|kill-preview|kill-on) request "$1" ;;
     run)
         [[ $# -ge 4 && $3 == -- ]] || { printf 'Usage: walker-vpn run vpn|direct -- COMMAND [ARG…]\n' >&2; exit 2; }
-        mode=$2; shift 3
+        mode=$2 app_region=host
+        shift 3
         run_protected "$mode" native '' "$@"
         ;;
     desktop|require-vpn|autostart)

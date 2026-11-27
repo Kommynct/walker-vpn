@@ -20,7 +20,7 @@ request=$(jq -nc '{
 }')
 mapfile -d '' -t observed < <(launch_app || :)
 expected=(direct flatpak org.example.App false program --flag '' 'two words' $'first\nsecond\n'
-          TZ=Etc/GMT+5 QT_QPA_PLATFORMTHEME=kde $'GTK_PATH=one\ntwo\n')
+          QT_QPA_PLATFORMTHEME=kde $'GTK_PATH=one\ntwo\n')
 [[ ${#observed[@]} == ${#expected[@]} ]]
 for i in "${!expected[@]}"; do [[ ${observed[i]} == "${expected[i]}" ]]; done
 

@@ -32,11 +32,24 @@ if [[ -d /run/systemd/resolve ]]; then
 fi
 
 source "${BASH_SOURCE[0]%/*}/session-env.sh"
-if zoneinfo=$(desktop_zoneinfo_dir /etc/localtime); then
-    session+=("TZDIR=$zoneinfo")
-fi
+read_desktop_timezone /etc/localtime /etc/timezone
+if [[ -n $desktop_tzdir ]]; then session+=("TZDIR=$desktop_tzdir"); fi
+if [[ -n $desktop_tz ]]; then session+=("TZ=$desktop_tz"); fi
 
 if [[ $kind == flatpak ]]; then
+    timezone_options=(--unset-env=TZDIR)
+    if [[ -n $desktop_tz ]]; then
+        timezone_options+=("--env=TZ=$desktop_tz")
+    elif [[ -f /etc/localtime ]]; then
+        # Flatpak needs a zone name to generate /etc/localtime. For a copied
+        # tzfile with no known name, share just that file through its monitor.
+        (
+            temporary=$(mktemp "$work/monitor/.localtime.XXXXXXXX") || exit 1
+            trap 'rm -f -- "$temporary"' EXIT
+            install -m444 /etc/localtime "$temporary" && mv -fT "$temporary" "$work/monitor/localtime"
+        ) || exit 1
+        timezone_options+=(--env=TZ=:/run/host/monitor/localtime)
+    fi
     # Enter the directory first so the kernel pins the target and rejects
     # other file types. Mount only within this private mount namespace.
     (
@@ -80,7 +93,7 @@ if [[ $kind == flatpak ]]; then
     # Flatpak uses the host TZDIR to set up /etc/localtime, then the app
     # resolves named zones using the database visible inside the sandbox.
     set -- "${WALKER_VPN_FLATPAK:-flatpak}" run --share=network --nosocket=session-bus --nosocket=system-bus \
-        --talk-name=org.kde.StatusNotifierWatcher --no-talk-name=org.freedesktop.Flatpak --unset-env=TZDIR "$@"
+        --talk-name=org.kde.StatusNotifierWatcher --no-talk-name=org.freedesktop.Flatpak "${timezone_options[@]}" "$@"
 else
     if [[ -x ${WALKER_VPN_LINK_OPENER:-} ]]; then
         # Some applications use the desktop opener's absolute path.
