@@ -1,6 +1,11 @@
 app_netns_dir=/run/netns
 app_netns_config=/etc/netns
 
+app_failure() {
+    printf 'ERROR %s\n' "$1"
+    fail "$1"
+}
+
 app_cleanup() {
     if [[ -n ${active_record:-} && -n ${active_lease:-} ]]; then
         flock -x "$active_lease" || return 1
@@ -288,8 +293,12 @@ launch_app() {
                 [[ $mode == "$running_mode" && $region == "${running_region:-host}" ]] ||
                     { fail 'Close the running app before using a different VPN route.'; return; }
                 exec {active_lease}<"$work/lease" || return 1
-                flock -sn "$active_lease" || { fail 'The app is shutting down. Try opening it again.'; return; }
-                [[ -f $active_record && $(< "$active_record") == "$registered" ]] || return 1
+                if ! flock -sn "$active_lease" ||
+                    [[ ! -f $active_record || $(< "$active_record") != "$registered" ]]; then
+                    printf 'RETRY\n'
+                    return 1
+                fi
+                if [[ $mode == vpn && $region == host ]]; then ensure_host_for_app || return 1; fi
                 run_app_in_namespace || result=$?
                 printf '%s\n' "$result" > "$run/result-$job"
                 return "$result"
@@ -297,6 +306,7 @@ launch_app() {
             rm -f -- "$active_record" || return 1
         fi
     fi
+    if [[ -n $app_id && $mode == vpn && $region == host ]]; then ensure_host_for_app || return 1; fi
     work=$(mktemp -d "$run/app.XXXXXXXX") || return 1
     namespace="wv$(od -An -N5 -tx1 /dev/urandom | tr -d ' \n')"
     trap app_cleanup EXIT

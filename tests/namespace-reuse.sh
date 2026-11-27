@@ -16,6 +16,7 @@ printf '%s %s %s %s\n' "$namespace" private0 vpn "$work" > "$run/active-native-o
 getent() { printf 'example:x:1000:100:Example:/home/example:/bin/sh\n'; }
 acquire() { :; }
 guard_init() { :; }
+ensure_host_for_app() { :; }
 release() { :; }
 fail() { return 1; }
 test_namespace_ip() {

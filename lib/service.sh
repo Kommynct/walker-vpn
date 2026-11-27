@@ -149,9 +149,12 @@ connect_host() {
     fi
     if mv -f "$temp/host.conf" "$profile" && tunnel_up; then
         printf '%s\n' "$selected" > "$run/region"
+        if printf '%s\n' "$selected" > "$state/last-host-region.tmp"; then
+            mv -fT "$state/last-host-region.tmp" "$state/last-host-region" || :
+        fi
         touch "$profile"
         if [[ ! -e $run/preference-off ]]; then rm -f "$run/preview"; fi
-        rm -f -- "$run/retrying"
+        rm -f -- "$run/retrying" "$run/manual-disconnect"
         rm -rf -- "$temp"
         return 0
     fi
@@ -172,6 +175,7 @@ connect_host() {
 disconnect_host() {
     local code=0
     # Prevent automatic recovery before attempting to remove the tunnel.
+    touch "$run/manual-disconnect" || return 1
     rm -f "$run/region" "$run/retrying"
     if tunnel_down; then
         rm -f "$profile" && guard_peer '' || code=1
@@ -199,6 +203,34 @@ recover() {
     fi
     touch "$run/retrying"
     tunnel_down && tunnel_up
+}
+
+# Runs with the manager lock held. A desktop launch can restore the host
+# policy after a cold boot, without silently switching to a dedicated tunnel.
+ensure_host_for_app() {
+    tunnel_is_up && return 0
+    local wanted=optimal
+    if [[ -e $run/manual-disconnect ]]; then
+        app_failure 'The host VPN was disconnected manually. Connect it from Walker VPN to start this app.'
+        return
+    fi
+    if [[ -f $run/region && -f $profile ]]; then
+        recover || :
+    elif [[ -s $state/pia-login.cred ]]; then
+        if [[ -r $state/last-host-region ]]; then
+            IFS= read -r wanted < "$state/last-host-region" || wanted=optimal
+            valid_region "$wanted" || wanted=optimal
+        fi
+        printf '%s\n' "$wanted" > "$run/pending-region" || return 1
+        publish_status || :
+        connect_host "$wanted" || :
+        rm -f "$run/pending-region"
+    else
+        app_failure 'Save a PIA login in Walker VPN to start this app.'
+        return
+    fi
+    publish_status || :
+    tunnel_is_up || app_failure 'Could not restore the host VPN for this app. Check the VPN location and PIA login.'
 }
 
 maintain() {

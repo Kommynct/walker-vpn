@@ -14,6 +14,7 @@ acquire() { :; }
 guard_init() { :; }
 guard_armed() { return 1; }
 tunnel_exists() { return 1; }
+ensure_host_for_app() { return 1; }
 fail() { return 1; }
 start_app_tunnel() {
     printf '%s\n' "$1" > "$run/selected"

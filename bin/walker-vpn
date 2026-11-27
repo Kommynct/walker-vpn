@@ -226,10 +226,24 @@ run_protected() {
         printf '%s\n' "$header"
         cat
     } | socat -t 2147483 - "UNIX-CONNECT:$socket" | {
-        IFS= read -r marker && [[ $marker == READY ]] || {
+        IFS= read -r marker || marker=
+        case $marker in
+            READY) ;;
+            'ERROR '*|RETRY)
+                if [[ -n ${launch_error_file:-} ]]; then
+                    printf '%s\n' "$marker" > "$launch_error_file"
+                elif [[ $marker == RETRY ]]; then
+                    printf 'The app is still shutting down.\n' >&2
+                else
+                    printf '%s\n' "${marker#ERROR }" >&2
+                fi
+                return 1
+                ;;
+            *)
             printf 'The app could not start in its VPN namespace. Check journalctl -u "walker-vpn@*.service".\n' >&2
             return 1
-        }
+            ;;
+        esac
         cat
     } || return 1
     code=$(jq -nc --arg job "$job" '{action:"app-result",$job}' | call) || return 1

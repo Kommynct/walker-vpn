@@ -765,6 +765,29 @@ install_desktop() (
     if [[ $reopen == true ]]; then reopen_routed_app "$selected" "$id" "$mode"; fi
 )
 
+launch_desktop_protected() (
+    local kind=$2 launch_error_file failure attempt
+    launch_error_file=$(mktemp) || return 1
+    trap 'rm -f -- "$launch_error_file"' EXIT
+    for attempt in 1 2 3 4; do
+        : > "$launch_error_file"
+        if run_protected "$@" </dev/null; then return 0; fi
+        failure=$(< "$launch_error_file")
+        [[ $failure == RETRY && $attempt != 4 ]] || break
+        sleep "$attempt"
+    done
+    case $failure in
+        'ERROR '*) notify "${failure#ERROR }" ;;
+        RETRY) notify 'The app is still shutting down. Try opening it again when it has closed.' ;;
+        *) if [[ $kind == flatpak ]]; then
+               notify 'Could not launch the Flatpak with its network policy.'
+           else
+               notify 'Could not launch the application with its network policy.'
+           fi ;;
+    esac
+    return 1
+)
+
 desktop_launch() (
     local id=${1:-} record kind mode source app_lock executable managed_command flatpak_command_override= app_region=host
     desktop_id "$id" || return 2
@@ -818,8 +841,7 @@ desktop_launch() (
         fi
         prepare_flatpak_session ||
             { notify 'Flatpak could not initialize its DNS monitor.'; return 1; }
-        run_protected "$mode" flatpak "${id%.desktop}" "$executable" "$@" </dev/null ||
-            { notify 'Could not launch the Flatpak with its network policy.'; return 1; }
+        launch_desktop_protected "$mode" flatpak "${id%.desktop}" "$executable" "$@"
     else
         # An older desktop override may still point into the previous system closure.
         if [[ ${1:-} == /nix/store/*/bin/* && -s $record/command-shim ]]; then
@@ -829,8 +851,7 @@ desktop_launch() (
                 set -- "/run/current-system/sw/bin/$managed_command" "$@"
             fi
         fi
-        run_protected "$mode" native "${id%.desktop}" "$@" </dev/null ||
-            { notify 'Could not launch the application with its network policy.'; return 1; }
+        launch_desktop_protected "$mode" native "${id%.desktop}" "$@"
     fi
 )
 
