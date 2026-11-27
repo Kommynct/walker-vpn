@@ -5,19 +5,10 @@ source "$lib/guard.sh"
 source "$lib/pia.sh"
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
-nft() { cat "$scratch/rules"; }
-for chain in output forward; do
-    jq -nc --arg chain "$chain" '{rule:{chain:$chain,expr:[{jump:{target:("block_"+$chain)}}]}}' > "$scratch/$chain"
-    jq -s '{nftables:.}' "$scratch/$chain" > "$scratch/rules"
-    if guard_armed; then exit 1; fi
-done
-jq -s '{nftables:.}' "$scratch/output" "$scratch/forward" > "$scratch/rules"
-guard_armed
-
 (
     run=$scratch
     id() { printf '123\n'; }
-    nft() { return 0; }
+    guard_check() { return 0; }
     ip() {
         if [[ $1 == -j ]]; then
             printf '%s\n' "$existing_rules"
@@ -82,4 +73,4 @@ catalog='[{"id":"test","servers":{"wg":[{"cn":"example.invalid","ip":"192.0.2.1"
 pia_profile "$catalog" test dummy "$scratch/profile" >/dev/null
 rg -Fxq 'DNS = 10.1.1.1, 10.1.1.3' "$scratch/profile"
 if pia_profile "$catalog" test dummy /dev/full >/dev/null 2>&1; then exit 1; fi
-printf 'Firewall status and profile generation checks passed.\n'
+printf 'Routing priority and profile generation checks passed.\n'

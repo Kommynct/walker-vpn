@@ -16,6 +16,6 @@ Walker VPN protects direct IP traffic from apps started through a managed launch
 
 A launch requires a separate mount and network namespace, the expected interface, DNS configuration, and the namespace’s default-drop output chain. Host routing rules stop forwarded app traffic when its selected routing table has no route. This applies to excluded apps using the main table and VPN-only apps using the host tunnel. The Flatpak launcher also checks for the expected network interface and resolver configuration from inside its sandbox. The regression tests cover shortcut migration, MIME arguments, route mismatch rejection, and detached-process lifetime.
 
-The maintenance timer can rebuild a removed host firewall table from runtime state. A privileged firewall flush can remove host kill-switch enforcement until that rebuild completes.
+The maintenance timer can rebuild a missing or incomplete host firewall table from runtime state. An armed switch reports degraded while its required firewall layout is missing. Walker VPN enables IPv4 forwarding on its own host-side app links and host WireGuard interface. Excluded apps require IPv4 forwarding on the selected physical uplink. The administrator can configure that interface through `boot.kernel.sysctl."net.ipv4.conf.<interface>.forwarding" = 1` on NixOS. A privileged firewall flush can remove host kill-switch enforcement until that rebuild completes.
 
 Testing the kernel, Flatpak, systemd, and PIA implementations themselves is outside the scope of this project.

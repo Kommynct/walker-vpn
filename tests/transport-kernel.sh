@@ -155,6 +155,17 @@ guard_init
 guard_armed
 nft get element inet walkervpn app_peers "{ $(< /run/dedicated-tuple) }" >/dev/null
 printf 'Guard recovery restored its valid active transport and removed a stale record.\n'
+for chain in block_output block_forward api_only; do
+    nft flush chain inet walkervpn "$chain"
+    if [[ $(guard_status) != degraded ]]; then
+        echo "The guard reported armed with an empty $chain chain." >&2
+        exit 1
+    fi
+    guard_init
+    [[ $(guard_status) == on ]]
+    nft get element inet walkervpn app_peers "{ $(< /run/dedicated-tuple) }" >/dev/null
+done
+echo 'Partial firewall damage registered as degraded and recovery restored the active transport.'
 
 # Leave a namespace with no processes in it. Forwarded startup must only
 # touch its own namespace and must avoid addresses used by other routes.
@@ -175,13 +186,24 @@ forward_fixture() {
 }
 direct=wv1111111111
 follow=wv2222222222
-forward_fixture "$direct" direct
-[[ $(sysctl -n net.ipv4.ip_forward) == 1 ]]
+ip link add unrelated0 type dummy
+if forward_fixture "$direct" direct 2>/dev/null; then
+    echo 'An excluded app changed the disabled uplink forwarding policy.' >&2
+    exit 1
+fi
+[[ $(sysctl -n net.ipv4.conf.uplink.forwarding) == 0 && ! -e /run/netns/$direct ]]
 forward_fixture "$follow" vpn
+[[ $(sysctl -n net.ipv4.conf.uplink.forwarding) == 0 ]]
+sysctl -qw net.ipv4.conf.uplink.forwarding=1
+forward_fixture "$direct" direct
+[[ $(sysctl -n net.ipv4.ip_forward) == 0 && $(sysctl -n net.ipv4.conf.unrelated0.forwarding) == 0 ]]
+[[ $(sysctl -n "net/ipv4/conf/${follow}_d/forwarding") == 1 ]]
+[[ $(sysctl -n "net/ipv4/conf/${direct}_d/forwarding") == 1 ]]
+echo 'App launch preserved host-wide and unrelated interface forwarding policy.'
 [[ -e /run/netns/$dedicated ]]
 ip -n unrelated link show dev foreign0 >/dev/null
-ip -n "$direct" -4 address show dev "${direct}_s" | grep -Fq '10.200.1.6/30'
-ip -n "$follow" -4 address show dev "${follow}_s" | grep -Fq '10.200.1.10/30'
+ip -n "$direct" -4 address show dev "${direct}_s" | grep -Fq '10.200.1.10/30'
+ip -n "$follow" -4 address show dev "${follow}_s" | grep -Fq '10.200.1.6/30'
 echo 'Forwarded startup preserved an unrelated empty namespace and skipped overlapping routes.'
 
 (
@@ -194,6 +216,7 @@ echo 'Forwarded startup preserved an unrelated empty namespace and skipped overl
     [[ ! -e /run/netns/$namespace && ! -e /etc/netns/$namespace ]]
     ip link show dev "${namespace}_d" >/dev/null
     ip link del "${namespace}_d"
+    [[ $(sysctl -n net.ipv4.ip_forward) == 0 && $(sysctl -n net.ipv4.conf.unrelated0.forwarding) == 0 ]]
 )
 echo 'A failed veth creation removed only the new app namespace and resolver.'
 
@@ -251,7 +274,7 @@ guard_armed
 # Simulate manual disconnect removing host routes and disarming the guard.
 ip link delete "$iface"
 guard_set off
-if guard_armed; then exit 1; fi
+[[ $(guard_status) == off ]]
 unreachable "$follow" 192.0.2.2
 reachable "$direct" 192.0.2.2
 keeper=$namespace_keeper

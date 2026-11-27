@@ -15,11 +15,9 @@ view=/run/walker-vpn-view
 catalog_file=$state/catalog.json
 
 status() {
-    local connection=disconnected kill=off region= last now has_login=false
+    local connection=disconnected kill region= last now has_login=false
     [[ -f $state/pia-login.cred ]] && has_login=true
-    if guard_armed; then kill=on
-    elif [[ -e $run/armed ]]; then kill=degraded
-    fi
+    kill=$(guard_status)
     if [[ -f $run/pending-region ]]; then
         region=$(< "$run/pending-region")
         connection=connecting

@@ -26,9 +26,10 @@ valid_hostname() { [[ $1 =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$ ]]; }
 valid_region() { [[ $1 =~ ^[a-zA-Z0-9_-]{1,64}$ ]]; }
 
 guard_init() {
-    local api_uid rules installed uid_rule mark_rule endpoint record veth uplink pair
+    local api_uid rules installed uid_rule mark_rule endpoint record veth uplink pair wanted=either
     api_uid=$(id -u walker-vpn-api) || return 1
-    if ! nft list set inet walkervpn host_peer >/dev/null 2>&1; then
+    if [[ -e $run/armed ]]; then wanted=on; fi
+    if ! guard_check "$wanted"; then
         local replace_table= restore_output= restore_forward=
         if nft list table inet walkervpn >/dev/null 2>&1; then
             replace_table="delete table inet walkervpn"
@@ -132,9 +133,6 @@ RULES
         '') ip -4 rule add pref "$bootstrap_pref" fwmark "$bootstrap_mark" lookup main || return 1 ;;
         *) printf 'The routing priority %s is already in use.\n' "$bootstrap_pref" >&2; return 1 ;;
     esac
-    if [[ -e $run/armed ]] && ! guard_armed; then
-        guard_set on || return 1
-    fi
 }
 
 guard_app_peers() {
@@ -162,13 +160,42 @@ guard_app_peers() {
     if ((${#stale[@]})); then rm -f -- "${stale[@]}"; fi
 }
 
-guard_armed() {
-    nft -j list table inet walkervpn 2>/dev/null | jq -e '
-        [.nftables[].rule? | select(. != null) |
-         select((.expr | length) == 1) | [.chain, .expr[0].jump.target]] |
-        any(.[]; . == ["output","block_output"]) and
-        any(.[]; . == ["forward","block_forward"])
+# Validate the layout as well as the jumps. A flushed regular chain returns
+# to its accept-policy base chain, even when the jump still exists.
+guard_check() {
+    nft -j list table inet walkervpn 2>/dev/null | jq -e --arg wanted "$1" '
+        def entries($key): [.nftables[] | .[$key] | objects];
+        def rules($name): [entries("rule")[] | select(.chain == $name) | .expr];
+        def base($name; $type; $hook; $priority):
+            any(entries("chain")[];
+                .name == $name and .type == $type and .hook == $hook and
+                .prio == $priority and .policy == "accept");
+        def blocking($name; $count):
+            rules($name) | length == $count and (.[-1][-1] | has("drop"));
+        def armed:
+            (rules("output") | length == 2 and .[1] == [{"jump":{"target":"block_output"}}]) and
+            rules("forward") == [[{"jump":{"target":"block_forward"}}]];
+        ([entries("set")[].name] | sort) == ["app_peers","bootstrap","direct","host_peer"] and
+        base("output"; "filter"; "output"; -10) and base("forward"; "filter"; "forward"; -10) and
+        base("api_route"; "route"; "output"; -155) and
+        base("remember_transport"; "filter"; "postrouting"; -151) and
+        base("restore_transport"; "filter"; "prerouting"; -151) and
+        (rules("api_route") | length == 1) and (rules("remember_transport") | length == 3) and
+        (rules("restore_transport") | length == 1) and blocking("api_only"; 2) and
+        blocking("block_output"; 5) and blocking("block_forward"; 5) and
+        rules("output")[0][-1] == {"jump":{"target":"api_only"}} and
+        (armed or ($wanted == "either" and
+            (rules("output") | length == 1) and (rules("forward") | length == 0)))
     ' >/dev/null
+}
+
+guard_armed() { guard_check on; }
+
+guard_status() {
+    if guard_armed; then printf '%s\n' on
+    elif [[ -e $run/armed ]]; then printf '%s\n' degraded
+    else printf '%s\n' off
+    fi
 }
 
 guard_set() {
@@ -253,6 +280,7 @@ tunnel_up() {
     done
     wg-quick up "$profile" >&2 || return 1
     if ! guard_peer "$endpoint" ||
+        ! sysctl -qw "net/ipv4/conf/$iface/forwarding=1" ||
         ! sysctl -q net.ipv4.conf.all.src_valid_mark=1 ||
         ! ip -4 route add default dev "$iface" table "$wgmark" ||
         ! ip -6 route add default dev "$iface" table "$wgmark" ||

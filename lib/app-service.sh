@@ -237,20 +237,24 @@ app_veth_addresses() {
 }
 
 start_forwarded_app() {
-    local link_index uplink forwarding addresses gateway address inside=${namespace}_s
+    local link_index uplink addresses gateway address inside=${namespace}_s
     local -a dns=()
     if [[ $mode == direct ]]; then
         uplink=$(physical_link) || { fail 'No active physical IPv4 link was found.'; return; }
+        if [[ $(sysctl -n "net/ipv4/conf/$uplink/forwarding") != 1 ]]; then
+            app_failure "IPv4 forwarding is disabled on $uplink. Enable forwarding for this uplink in the system configuration to use an excluded app."
+            return
+        fi
     else
         uplink=$iface
         tunnel_is_up || { fail 'The host VPN tunnel is unavailable.'; return; }
+        # Also cover a host tunnel already running at service upgrade.
+        sysctl -qw "net/ipv4/conf/$uplink/forwarding=1" || return 1
     fi
     mapfile -t dns < <(link_dns "$uplink" | sed 's/^/nameserver /')
     (("${#dns[@]}")) || { fail 'The selected uplink has no IPv4 DNS servers.'; return; }
     addresses=$(app_veth_addresses) || { fail 'Could not allocate an IPv4 subnet for the app.'; return; }
     read -r gateway address <<< "$addresses"
-    forwarding=$(sysctl -n net.ipv4.ip_forward) || return 1
-    [[ $forwarding == 1 ]] || sysctl -qw net.ipv4.ip_forward=1 || return 1
     start_app_namespace "${dns[@]}" || return 1
     ip link add "${namespace}_d" type veth peer name "$inside" netns "$namespace" || return 1
     veth=${namespace}_d
@@ -259,7 +263,8 @@ start_forwarded_app() {
         ip -n "$namespace" -4 address add "$address/30" dev "$inside" &&
         ip -n "$namespace" link set dev "$inside" up &&
         ip -n "$namespace" -4 route add default via "$gateway" dev "$inside" || return 1
-    app_policy || fail 'Could not install the app isolation policy.'
+    app_policy || { fail 'Could not install the app isolation policy.'; return; }
+    sysctl -qw "net/ipv4/conf/$veth/forwarding=1"
 }
 
 launch_app() {
