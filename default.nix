@@ -136,7 +136,7 @@ in {
     };
 
     systemd.user.sockets.walker-vpn-links = {
-      description = "Open web links in the desktop session";
+      description = "Open web links and local directories in the desktop session";
       wantedBy = [ "sockets.target" ];
       socketConfig = {
         ListenStream = "%t/walker-vpn-links.sock";
@@ -147,7 +147,7 @@ in {
     };
 
     systemd.user.services."walker-vpn-links@" = {
-      description = "Open a routed app’s web link";
+      description = "Open a routed app’s web link or local directory";
       # Desktop entries can name executables from the system or user profile.
       environment.PATH = lib.mkForce (lib.concatStringsSep ":" [
         "/run/wrappers/bin"
