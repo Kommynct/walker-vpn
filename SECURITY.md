@@ -18,4 +18,4 @@ A launch requires a separate mount and network namespace, the expected interface
 
 The maintenance timer can rebuild a removed host firewall table from runtime state. A privileged firewall flush can remove host kill-switch enforcement until that rebuild completes.
 
-Testing the kernel, Flatpak, systemd, Vopono, and PIA implementations themselves is outside the scope of this project.
+Testing the kernel, Flatpak, systemd, and PIA implementations themselves is outside the scope of this project.

@@ -14,12 +14,6 @@ if [[ ! -x $dnsmasq ]]; then
     exit 1
 fi
 dnsmasq=$(realpath -- "$dnsmasq")
-vopono=${WALKER_VPN_TEST_VOPONO:-$(command -v vopono || :)}
-if [[ ! -x $vopono ]]; then
-    echo "Set WALKER_VPN_TEST_VOPONO or add Vopono to PATH." >&2
-    exit 1
-fi
-PATH="$(dirname "$(realpath -- "$vopono")"):$PATH"
 
 # Resolve NixOS profile links before hiding the host's runtime directory.
 IFS=: read -ra search_path <<< "$PATH"
@@ -123,7 +117,7 @@ ip -6 route add default dev "$iface" table "$wgmark"
 ip -4 rule add pref "$tunnel_return_pref" iif "$iface" table main suppress_prefixlength 0
 ip -4 rule add pref "$tunnel_pref" not fwmark "$wgmark" table "$wgmark"
 ip -6 rule add pref "$tunnel_pref" not fwmark "$wgmark" table "$wgmark"
-sysctl -qw net.ipv4.ip_forward=1
+sysctl -qw net.ipv4.ip_forward=0
 sysctl -qw net.ipv4.conf.all.rp_filter=1
 sysctl -qw net.ipv4.conf.all.src_valid_mark=1
 
@@ -162,29 +156,46 @@ guard_armed
 nft get element inet walkervpn app_peers "{ $(< /run/dedicated-tuple) }" >/dev/null
 printf 'Guard recovery restored its valid active transport and removed a stale record.\n'
 
-# Run the actual Vopono forwarding backend and remove its shared NAT.
-ip netns exec fixture sleep infinity &
-sleep .1
-export HOME=/run/vopono-fixture XDG_CONFIG_HOME=/run/vopono-fixture RUST_LOG=info
-mkdir -p "$HOME"
+# Leave a namespace with no processes in it. Forwarded startup must only
+# touch its own namespace and must avoid addresses used by other routes.
+ip netns add unrelated
+ip -n unrelated link add foreign0 type dummy
+ip -4 route add blackhole 10.200.0.0/24
+ip -4 route add blackhole 10.200.1.2/32 table 12345
 ip route add default via 192.0.2.2 dev uplink
 physical_link() { echo uplink; }
 link_dns() { if [[ $1 == uplink ]]; then echo 192.0.2.2; else echo 10.91.0.1; fi; }
 exec {lock}>"$run/manager.lock"
 release() { exec {lock}>&-; unset lock; }
 forward_fixture() {
-    local namespace=$1 mode=$2 veth= work
+    local namespace=$1 mode=$2 veth= work app_iface= namespace_keeper=
+    local owns_netns=false owns_netns_dns=false pair= app_route_table= app_route_denied=false
     work=$(mktemp -d "$run/app.XXXXXXXX")
-    start_forwarded_app || { cat "$work/vopono.log" >&2; return 1; }
+    start_forwarded_app
 }
 direct=wv1111111111
 follow=wv2222222222
 forward_fixture "$direct" direct
+[[ $(sysctl -n net.ipv4.ip_forward) == 1 ]]
 forward_fixture "$follow" vpn
 [[ -e /run/netns/$dedicated ]]
+ip -n unrelated link show dev foreign0 >/dev/null
+ip -n "$direct" -4 address show dev "${direct}_s" | grep -Fq '10.200.1.6/30'
+ip -n "$follow" -4 address show dev "${follow}_s" | grep -Fq '10.200.1.10/30'
+echo 'Forwarded startup preserved an unrelated empty namespace and skipped overlapping routes.'
 
-nft list table inet vopono_nat >/dev/null
-nft delete table inet vopono_nat
+(
+    namespace=wv3333333333 mode=direct work=$(mktemp -d "$run/app.XXXXXXXX")
+    veth= pair= app_peer= namespace_keeper= owns_wireguard=false
+    owns_netns=false owns_netns_dns=false
+    ip link add "${namespace}_d" type dummy
+    if start_forwarded_app 2>/dev/null; then exit 1; fi
+    app_cleanup
+    [[ ! -e /run/netns/$namespace && ! -e /etc/netns/$namespace ]]
+    ip link show dev "${namespace}_d" >/dev/null
+    ip link del "${namespace}_d"
+)
+echo 'A failed veth creation removed only the new app namespace and resolver.'
 
 reachable() { ip netns exec "$1" ping -q -n -c 1 -W 2 "$2" >/dev/null 2>&1; }
 unreachable() {
@@ -249,4 +260,4 @@ if kill -0 "$keeper" 2>/dev/null || [[ -e /run/netns/$dedicated ]]; then
     echo 'Closing the dedicated namespace left its keeper or handle behind.' >&2
     exit 1
 fi
-printf 'Synthetic IPv4 and DNS follow the three app routes through removal of Vopono’s shared NAT and independent tunnel drops. IPv6 did not reach the physical peer.\n'
+printf 'Synthetic IPv4 and DNS follow the three app routes through independent tunnel drops. IPv6 did not reach the physical peer.\n'

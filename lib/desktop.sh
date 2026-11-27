@@ -219,9 +219,16 @@ app_processes() {
 }
 
 app_closed() {
-    local running
-    running=$(app_processes "$@") || return 2
-    [[ -z $running ]]
+    local running attempt=0
+    while :; do
+        running=$(app_processes "$@") || return 2
+        [[ -z $running ]] && return 0
+        # Flatpak can list an instance after its last process has exited.
+        # Wait for that entry to disappear without accepting a live process.
+        [[ $2 == flatpak && $running == 0 ]] && (( attempt < 50 )) || return 1
+        sleep .1
+        (( ++attempt ))
+    done
 }
 
 app_windows() {

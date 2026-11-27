@@ -58,37 +58,15 @@ app_cleanup() {
             ip -4 rule del pref "$app_deny_pref" iif "$veth" prohibit 2>/dev/null || :
         fi
     fi
-    if [[ -n ${vpn_pid:-} ]]; then
-        kill -INT "$vpn_pid" 2>/dev/null || :
-        for ((attempt=0; attempt<30; attempt++)); do
-            kill -0 "$vpn_pid" 2>/dev/null || break
-            sleep 0.1
-        done
-        kill -KILL "$vpn_pid" 2>/dev/null || :
-        wait "$vpn_pid" 2>/dev/null || :
-    fi
     rm -rf -- "$work"
 }
 
-start_app_tunnel() {
-    local wanted=$1 config=$work/wvapp.conf address endpoint peer_ip peer_port port attempt
-    local -a profile_fields=() dns=()
-    build_profile "$wanted" "$config" >/dev/null || return 1
-    mapfile -t profile_fields < <(awk '
-        $1 == "Address" { address=$3 }
-        $1 == "Endpoint" { endpoint=$3 }
-        $1 == "DNS" { for (i=3; i<=NF; i++) { sub(/,$/, "", $i); dns=dns "nameserver " $i "\n" } }
-        END { if (address && endpoint && dns) printf "%s\n%s\n%s", address, endpoint, dns }
-    ' "$config")
-    (( ${#profile_fields[@]} >= 3 )) || return 1
-    address=${profile_fields[0]} endpoint=${profile_fields[1]} dns=("${profile_fields[@]:2}")
-    peer_ip=${endpoint%:*} peer_port=${endpoint##*:}
-    ipv4 "$peer_ip" && valid_port "$peer_port" || return 1
-
+start_app_namespace() {
+    local attempt
     ip netns add "$namespace" || return 1
     owns_netns=true
-    # Vopono removes named namespaces with no resident process on startup.
-    # Keep a dedicated namespace occupied even between desktop launches.
+    # Keep the namespace occupied until cleanup, including before the app
+    # enters it. Other namespace tools may reap empty named namespaces.
     (
         if [[ -n ${lock:-} ]]; then exec {lock}>&-; fi
         exec nsenter --net="$app_netns_dir/$namespace" sleep infinity
@@ -103,9 +81,27 @@ start_app_tunnel() {
     mkdir -p -m755 "$app_netns_config" || return 1
     mkdir -m755 -- "$app_netns_config/$namespace" || return 1
     owns_netns_dns=true
-    printf '%s\n' "${dns[@]}" > "$app_netns_config/$namespace/resolv.conf" || return 1
-    chmod 644 "$app_netns_config/$namespace/resolv.conf" || return 1
-    ip -n "$namespace" link set lo up || return 1
+    printf '%s\n' "$@" > "$app_netns_config/$namespace/resolv.conf" &&
+        chmod 644 "$app_netns_config/$namespace/resolv.conf" &&
+        ip -n "$namespace" link set lo up
+}
+
+start_app_tunnel() {
+    local wanted=$1 config=$work/wvapp.conf address endpoint peer_ip peer_port port
+    local -a profile_fields=() dns=()
+    build_profile "$wanted" "$config" >/dev/null || return 1
+    mapfile -t profile_fields < <(awk '
+        $1 == "Address" { address=$3 }
+        $1 == "Endpoint" { endpoint=$3 }
+        $1 == "DNS" { for (i=3; i<=NF; i++) { sub(/,$/, "", $i); dns=dns "nameserver " $i "\n" } }
+        END { if (address && endpoint && dns) printf "%s\n%s\n%s", address, endpoint, dns }
+    ' "$config")
+    (( ${#profile_fields[@]} >= 3 )) || return 1
+    address=${profile_fields[0]} endpoint=${profile_fields[1]} dns=("${profile_fields[@]:2}")
+    peer_ip=${endpoint%:*} peer_port=${endpoint##*:}
+    ipv4 "$peer_ip" && valid_port "$peer_port" || return 1
+
+    start_app_namespace "${dns[@]}" || return 1
     # WireGuard retains its UDP socket in the namespace where it was created.
     # The app sees only loopback and WireGuard, with no physical veth to use.
     ip link add "$namespace" type wireguard || return 1
@@ -212,41 +208,63 @@ RULES
     fi
 }
 
+app_veth_addresses() {
+    # Allocate a /30 under the manager lock. Skip any intersection with a
+    # non-default route, including local addresses and routes in other tables.
+    ip -j -4 route show table all | jq -r '.[] | .dst | strings | select(. != "default" and . != "0.0.0.0/0")' |
+        awk -F '[./]' '
+            BEGIN { base = (10 * 256 + 200) * 65536; last = base + 65535 }
+            NF >= 4 {
+                address = (($1 * 256 + $2) * 256 + $3) * 256 + $4
+                size = 2 ^ (32 - (NF == 5 ? $5 : 32))
+                start = int(address / size) * size
+                end = start + size - 1
+                if (start > last || end < base) next
+                first_block = start < base ? 0 : int((start - base) / 4)
+                last_block = end > last ? 16383 : int((end - base) / 4)
+                for (block = first_block; block <= last_block; block++) used[block] = 1
+            }
+            END {
+                for (block = 0; block < 16384; block++) {
+                    if (block in used) continue
+                    printf "10.200.%d.%d 10.200.%d.%d\n", int(block / 64), block % 64 * 4 + 1,
+                        int(block / 64), block % 64 * 4 + 2
+                    exit
+                }
+                exit 1
+            }
+        '
+}
+
 start_forwarded_app() {
-    local link_index uplink item marker wait_start
-    local -a dns=() options=()
+    local link_index uplink forwarding addresses gateway address inside=${namespace}_s
+    local -a dns=()
     if [[ $mode == direct ]]; then
         uplink=$(physical_link) || { fail 'No active physical IPv4 link was found.'; return; }
     else
         uplink=$iface
         tunnel_is_up || { fail 'The host VPN tunnel is unavailable.'; return; }
     fi
-    mapfile -t dns < <(link_dns "$uplink")
+    mapfile -t dns < <(link_dns "$uplink" | sed 's/^/nameserver /')
     (("${#dns[@]}")) || { fail 'The selected uplink has no IPv4 DNS servers.'; return; }
-    for item in "${dns[@]}"; do options+=(--dns "$item"); done
-    : > "$work/vopono.toml" || return 1
-    (
-        exec {lock}>&-
-        exec vopono exec "${options[@]}" --provider none --protocol none --firewall nftables --disable-ipv6 \
-            --vopono-config "$work/vopono.toml" --custom-netns-name "$namespace" \
-            --interface "$uplink" --no-proxy --create-netns-only none
-    ) </dev/null >"$work/vopono.log" 2>&1 &
-    vpn_pid=$!
-    marker="Created netns $namespace -"
-    wait_start=$SECONDS
-    until rg -q -F "$marker" "$work/vopono.log"; do
-        if ! kill -0 "$vpn_pid" 2>/dev/null || (( SECONDS - wait_start >= 22 )); then
-            fail 'Vopono did not start the app namespace.'
-            return
-        fi
-        sleep 0.1
-    done
+    addresses=$(app_veth_addresses) || { fail 'Could not allocate an IPv4 subnet for the app.'; return; }
+    read -r gateway address <<< "$addresses"
+    forwarding=$(sysctl -n net.ipv4.ip_forward) || return 1
+    [[ $forwarding == 1 ]] || sysctl -qw net.ipv4.ip_forward=1 || return 1
+    start_app_namespace "${dns[@]}" || return 1
+    ip link add "${namespace}_d" type veth peer name "$inside" netns "$namespace" || return 1
+    veth=${namespace}_d
+    ip -4 address add "$gateway/30" dev "$veth" &&
+        ip link set dev "$veth" up &&
+        ip -n "$namespace" -4 address add "$address/30" dev "$inside" &&
+        ip -n "$namespace" link set dev "$inside" up &&
+        ip -n "$namespace" -4 route add default via "$gateway" dev "$inside" || return 1
     app_policy || fail 'Could not install the app isolation policy.'
 }
 
 launch_app() {
     local app_kind app_id uid gid home user_entry job forward_files argc result=0 cleanup_uid=
-    mode= region= namespace= work= veth= pair= vpn_pid= active_record= active_lease= app_iface=
+    mode= region= namespace= work= veth= pair= active_record= active_lease= app_iface=
     owns_netns=false owns_netns_dns=false owns_wireguard=false wireguard_moved=false app_peer= namespace_keeper=
     app_route_table= app_route_denied=false
     local item

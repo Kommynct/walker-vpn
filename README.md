@@ -1,6 +1,6 @@
 # Walker VPN
 
-A Bash menu for PIA WireGuard on NixOS. It opens in Walker's dmenu mode from a Waybar button. Systemd manages the host tunnel, recovery timer and Vopono app namespaces. It works with IWD and either openresolv or systemd-resolved.
+A Bash menu for PIA WireGuard on NixOS. It opens in Walker's dmenu mode from a Waybar button. Systemd manages the host tunnel, recovery timer and app network namespaces. It works with IWD and either openresolv or systemd-resolved.
 
 ## Install
 
@@ -28,7 +28,7 @@ The administrator recovery command is `run0 systemctl start walker-vpn-emergency
 ## App routing
 
 - **VPN-only apps** use either the system VPN location or their own PIA WireGuard tunnel. In **App routing…**, select an app, choose **VPN only**, and pick **Follow the system VPN location**, **Optimal**, or a named location. Launching an app that follows the system VPN can reconnect the host tunnel using the saved login and last successful location. If you disconnected manually during this boot, connect the host VPN from the menu first. While the host tunnel is down these apps lose connectivity. A named location or **Optimal** keeps the app on its own tunnel, even with the system kill switch on. If its dedicated tunnel drops, the app loses network access. Existing VPN-only apps follow the system location until you choose a different one.
-- **Excluded apps** run in a Vopono namespace restricted to the physical IPv4 uplink and its DNS. They retain this route when the host VPN or kill switch is active. Restart an excluded app after changing uplinks.
+- **Excluded apps** run in a namespace restricted to the physical IPv4 uplink and its DNS. They retain this route when the host VPN or kill switch is active. Restart an excluded app after changing uplinks.
 - If an app is still running when you change its route or location, save your work and choose **Close and reopen app**. Walker VPN applies the change after the process exits and reopens the selected launcher. **Cancel** keeps the current setting. At the route menu, **Follow system VPN** restores the original launcher.
 - Desktop actions and native shortcuts that resolve to the same executable share the saved route. Flatpak shortcuts that launch the same exported app share its route and keep their own commands. Opening another shortcut, file or URI for a running routed app uses its existing protected namespace. Its firewall and uplink stay in place if the original launcher exits while the app is still running. Walker VPN refreshes Elephant after changing a launcher.
 - Managed apps receive the desktop session's theme settings. Native apps use a filtered D-Bus connection for tray icons, notifications and theme settings. Flatpaks retain their filtered desktop bus. Native apps launched by an explicit path to the underlying executable still follow the host policy.
@@ -53,7 +53,7 @@ systemctl status walker-vpn.socket walker-vpn-maintain.timer
 journalctl -u 'walker-vpn@*.service' -u walker-vpn-maintain.service -n 80
 ```
 
-The [KDE WireGuard applet](https://github.com/minkytown/KDE-Wireguard-applet) provided the feature baseline. [Vopono](https://github.com/jamesmcm/vopono) supplies app network namespaces. The public PIA CA is sourced from [PIA's manual connection scripts](https://github.com/pia-foss/manual-connections).
+The [KDE WireGuard applet](https://github.com/minkytown/KDE-Wireguard-applet) provided the feature baseline. The public PIA CA is sourced from [PIA's manual connection scripts](https://github.com/pia-foss/manual-connections).
 
 ## Security scope
 

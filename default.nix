@@ -50,7 +50,7 @@ let
   '';
   backendPath = with pkgs; [
     bash coreutils findutils gawk getent gnugrep gnused jq iproute2 iptables nftables wireguard-tools
-    openresolv systemd curl util-linux procps ripgrep dbus xdg-dbus-proxy pkgs.flatpak cfg.voponoPackage
+    openresolv systemd curl util-linux procps ripgrep dbus xdg-dbus-proxy pkgs.flatpak
   ];
   backendCommand = "${pkgs.bash}/bin/bash ${backend}/service.sh ${backend} ${cfg.user}";
   commonService = {
@@ -59,7 +59,6 @@ let
       HOME = "/var/lib/walker-vpn";
       XDG_CONFIG_HOME = "/var/lib/walker-vpn";
       SSL_CERT_FILE = "/etc/ssl/certs/ca-bundle.crt";
-      RUST_LOG = "info";
       WALKER_VPN_FLATPAK = lib.getExe pkgs.flatpak;
       WALKER_VPN_LINK_OPENER = lib.getExe' linkOpener "xdg-open";
       WALKER_VPN_DESKTOP_OPENER = desktopOpener;
@@ -83,7 +82,12 @@ in {
       defaultText = lib.literalExpression "the only normal user in wheel, when unambiguous";
       description = "Desktop account allowed to use the Walker VPN control socket.";
     };
-    voponoPackage = lib.mkPackageOption pkgs "vopono" { };
+    # Accept existing module configurations. Forwarding no longer uses Vopono.
+    voponoPackage = lib.mkOption {
+      type = lib.types.package;
+      default = pkgs.vopono;
+      description = "Legacy option retained for existing configurations.";
+    };
   };
 
   config = {

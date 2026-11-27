@@ -54,3 +54,25 @@ run_protected() { printf 'ERROR Connect the host VPN first.\n' > "$launch_error_
 if launch_desktop_protected vpn native org.example.Client client; then exit 1; fi
 [[ $(< "$scratch/notice") == 'Connect the host VPN first.' ]]
 printf 'Host recovery honors saved location and manual disconnect. Launch retries only a pre-start shutdown conflict.\n'
+
+flatpak() {
+    local attempts=0
+    if [[ -f $scratch/flatpak-attempts ]]; then attempts=$(< "$scratch/flatpak-attempts"); fi
+    (( ++attempts ))
+    printf '%s\n' "$attempts" > "$scratch/flatpak-attempts"
+    if [[ ${flatpak_teardown:-} == lasting || $attempts -lt 4 ]]; then
+        printf 'org.example.Client\t54123\n'
+    fi
+}
+ps() {
+    if [[ ${flatpak_teardown:-} == live ]]; then printf '54123 1 S\n'; fi
+}
+app_closed org.example.Client.desktop flatpak "$scratch/placeholder"
+[[ $(< "$scratch/flatpak-attempts") == 4 ]]
+rm "$scratch/flatpak-attempts"
+if flatpak_teardown=live app_closed org.example.Client.desktop flatpak "$scratch/placeholder"; then exit 1; fi
+[[ $(< "$scratch/flatpak-attempts") == 1 ]]
+rm "$scratch/flatpak-attempts"
+if flatpak_teardown=lasting app_closed org.example.Client.desktop flatpak "$scratch/placeholder"; then exit 1; fi
+[[ $(< "$scratch/flatpak-attempts") == 51 ]]
+printf 'Flatpak launch waits for a stale teardown entry and still refuses a live app.\n'
