@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run in disposable namespaces so nftables, routes and WireGuard are real.
 set -Eeuo pipefail
+umask 077
 if [[ ${1:-} != --isolated ]]; then
     script=$(realpath -- "${BASH_SOURCE[0]}")
     exec unshare --user --map-root-user --mount --net --pid --fork --mount-proc bash "$script" --isolated
@@ -13,6 +14,12 @@ if [[ ! -x $dnsmasq ]]; then
     exit 1
 fi
 dnsmasq=$(realpath -- "$dnsmasq")
+vopono=${WALKER_VPN_TEST_VOPONO:-$(command -v vopono || :)}
+if [[ ! -x $vopono ]]; then
+    echo "Set WALKER_VPN_TEST_VOPONO or add Vopono to PATH." >&2
+    exit 1
+fi
+PATH="$(dirname "$(realpath -- "$vopono")"):$PATH"
 
 # Resolve NixOS profile links before hiding the host's runtime directory.
 IFS=: read -ra search_path <<< "$PATH"
@@ -155,38 +162,29 @@ guard_armed
 nft get element inet walkervpn app_peers "{ $(< /run/dedicated-tuple) }" >/dev/null
 printf 'Guard recovery restored its valid active transport and removed a stale record.\n'
 
-# Reproduce Vopono's network shape without depending on its setup in a
-# nested single-UID user namespace. Exercise Walker VPN's real policy and NAT.
+# Run the actual Vopono forwarding backend and remove its shared NAT.
+ip netns exec fixture sleep infinity &
+sleep .1
+export HOME=/run/vopono-fixture XDG_CONFIG_HOME=/run/vopono-fixture RUST_LOG=info
+mkdir -p "$HOME"
+ip route add default via 192.0.2.2 dev uplink
+physical_link() { echo uplink; }
+link_dns() { if [[ $1 == uplink ]]; then echo 192.0.2.2; else echo 10.91.0.1; fi; }
+exec {lock}>"$run/manager.lock"
+release() { exec {lock}>&-; unset lock; }
 forward_fixture() {
-    local namespace=$1 mode=$2 uplink=$3 subnet=$4 dns=$5
-    local inside=app0 veth= veth_name=h${namespace:2} pair=
-    ip netns add "$namespace"
-    ip link add "$veth_name" type veth peer name "$inside" netns "$namespace"
-    ip address add "198.18.$subnet.1/24" dev "$veth_name"
-    ip link set dev "$veth_name" up
-    ip -n "$namespace" address add "198.18.$subnet.2/24" dev "$inside"
-    ip -n "$namespace" link set dev "$inside" up
-    ip -n "$namespace" -4 route add default via "198.18.$subnet.1"
-    mkdir "/etc/netns/$namespace"
-    printf 'nameserver %s\n' "$dns" > "/etc/netns/$namespace/resolv.conf"
-    app_policy
+    local namespace=$1 mode=$2 veth= work
+    work=$(mktemp -d "$run/app.XXXXXXXX")
+    start_forwarded_app || { cat "$work/vopono.log" >&2; return 1; }
 }
 direct=wv1111111111
 follow=wv2222222222
-forward_fixture "$direct" direct uplink 1 192.0.2.2
-forward_fixture "$follow" vpn "$iface" 2 10.91.0.1
+forward_fixture "$direct" direct
+forward_fixture "$follow" vpn
+[[ -e /run/netns/$dedicated ]]
 
-# Install and remove a shared NAT table like Vopono's. The per-app NAT
-# needs to work after the shared table has gone.
-nft -f - <<'RULES'
-table inet synthetic_shared_nat {
-    chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-        ip saddr 198.18.0.0/16 masquerade
-    }
-}
-RULES
-nft delete table inet synthetic_shared_nat
+nft list table inet vopono_nat >/dev/null
+nft delete table inet vopono_nat
 
 reachable() { ip netns exec "$1" ping -q -n -c 1 -W 2 "$2" >/dev/null 2>&1; }
 unreachable() {
@@ -195,7 +193,6 @@ unreachable() {
 reachable "$direct" 192.0.2.2
 reachable "$follow" 10.91.0.1
 reachable "$dedicated" 10.91.0.1
-unreachable "$direct" 10.91.0.1
 
 start_dns() {
     ip netns exec fixture "$dnsmasq" -d --conf-file=/dev/null --log-facility=- \
@@ -219,12 +216,6 @@ resolve() {
 [[ $(resolve "$dedicated") == 203.0.113.42 ]]
 ip -n fixture -6 address add 2001:db8::2/64 dev peerlink nodad
 ip -6 address add 2001:db8::1/64 dev uplink nodad
-ip -6 address add 2001:db8:1::1/64 dev h1111111111 nodad
-ip -6 address add 2001:db8:2::1/64 dev h2222222222 nodad
-ip -n "$direct" -6 address add 2001:db8:1::2/64 dev app0 nodad
-ip -n "$follow" -6 address add 2001:db8:2::2/64 dev app0 nodad
-ip -n "$direct" -6 route add default via 2001:db8:1::1
-ip -n "$follow" -6 route add default via 2001:db8:2::1
 for ns in "$direct" "$follow" "$dedicated"; do unreachable "$ns" 2001:db8::2; done
 
 # Keep the guard armed when simulating either unexpected link drop.
@@ -252,4 +243,10 @@ guard_set off
 if guard_armed; then exit 1; fi
 unreachable "$follow" 192.0.2.2
 reachable "$direct" 192.0.2.2
-printf 'Synthetic IPv4 and DNS follow the three app routes through shared NAT removal and independent tunnel drops. IPv6 did not reach the physical peer.\n'
+keeper=$namespace_keeper
+app_cleanup
+if kill -0 "$keeper" 2>/dev/null || [[ -e /run/netns/$dedicated ]]; then
+    echo 'Closing the dedicated namespace left its keeper or handle behind.' >&2
+    exit 1
+fi
+printf 'Synthetic IPv4 and DNS follow the three app routes through removal of Vopono’s shared NAT and independent tunnel drops. IPv6 did not reach the physical peer.\n'

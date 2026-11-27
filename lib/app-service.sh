@@ -25,6 +25,10 @@ app_cleanup() {
             ip "${netns[@]}" link del "$app_iface" >&2 || return 1
         fi
     fi
+    if [[ -n ${namespace_keeper:-} ]]; then
+        kill -TERM "$namespace_keeper" 2>/dev/null || :
+        wait "$namespace_keeper" 2>/dev/null || :
+    fi
     if [[ ${owns_netns:-false} == true && -e $app_netns_dir/$namespace ]]; then
         ip netns del "$namespace" >&2 || return 1
     fi
@@ -62,7 +66,7 @@ app_cleanup() {
 }
 
 start_app_tunnel() {
-    local wanted=$1 config=$work/wvapp.conf address endpoint peer_ip peer_port port
+    local wanted=$1 config=$work/wvapp.conf address endpoint peer_ip peer_port port attempt
     local -a profile_fields=() dns=()
     build_profile "$wanted" "$config" >/dev/null || return 1
     mapfile -t profile_fields < <(awk '
@@ -78,6 +82,19 @@ start_app_tunnel() {
 
     ip netns add "$namespace" || return 1
     owns_netns=true
+    # Vopono removes named namespaces with no resident process on startup.
+    # Keep a dedicated namespace occupied even between desktop launches.
+    (
+        if [[ -n ${lock:-} ]]; then exec {lock}>&-; fi
+        exec nsenter --net="$app_netns_dir/$namespace" sleep infinity
+    ) </dev/null >/dev/null 2>&1 &
+    namespace_keeper=$!
+    for ((attempt=0; attempt<100; attempt++)); do
+        if [[ /proc/$namespace_keeper/ns/net -ef $app_netns_dir/$namespace ]]; then break; fi
+        kill -0 "$namespace_keeper" 2>/dev/null || return 1
+        sleep .01
+    done
+    ((attempt < 100)) || return 1
     mkdir -p -m755 "$app_netns_config" || return 1
     mkdir -m755 -- "$app_netns_config/$namespace" || return 1
     owns_netns_dns=true
@@ -225,7 +242,7 @@ start_forwarded_app() {
 launch_app() {
     local app_kind app_id uid gid home user_entry job forward_files argc result=0 cleanup_uid=
     mode= region= namespace= work= veth= pair= vpn_pid= active_record= active_lease= app_iface=
-    owns_netns=false owns_netns_dns=false owns_wireguard=false wireguard_moved=false app_peer=
+    owns_netns=false owns_netns_dns=false owns_wireguard=false wireguard_moved=false app_peer= namespace_keeper=
     app_route_table= app_route_denied=false
     local item
     local -a fields=() args=() session=()
