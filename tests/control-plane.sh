@@ -45,6 +45,7 @@ guard_armed
     work=$scratch/app
     mkdir "$work"
     nft() { cat >/dev/null; }
+    sysctl() { [[ $* == '-qw net/ipv4/conf/outside/rp_filter=2' ]]; }
     ip() {
         case "$1 $2" in
             '-n wv0123456789')

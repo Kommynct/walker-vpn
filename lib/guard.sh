@@ -28,20 +28,25 @@ valid_region() { [[ $1 =~ ^[a-zA-Z0-9_-]{1,64}$ ]]; }
 guard_init() {
     local api_uid rules installed uid_rule mark_rule endpoint record veth uplink pair
     api_uid=$(id -u walker-vpn-api) || return 1
-    if ! nft list table inet walkervpn >/dev/null 2>&1; then
-        local restore_output= restore_forward=
-        if [[ -e $run/armed ]]; then
+    if ! nft list set inet walkervpn host_peer >/dev/null 2>&1; then
+        local replace_table= restore_output= restore_forward=
+        if nft list table inet walkervpn >/dev/null 2>&1; then
+            replace_table="delete table inet walkervpn"
+        fi
+        if [[ -e $run/armed ]] || guard_armed; then
             restore_output="add rule inet walkervpn output jump block_output"
             restore_forward="add rule inet walkervpn forward jump block_forward"
         fi
         nft -f - <<RULES || return 1
+$replace_table
 table inet walkervpn {
     set bootstrap {
         type ipv4_addr . inet_service
         flags timeout
         timeout 100s
     }
-    set peer { type ipv4_addr . inet_service; }
+    set host_peer { type inet_service . ipv4_addr . inet_service; }
+    set app_peers { type inet_service . ipv4_addr . inet_service; }
     set direct { type iface_index . iface_index; }
 
     chain api_route {
@@ -57,7 +62,8 @@ table inet walkervpn {
     chain remember_transport {
         type filter hook postrouting priority -151; policy accept;
         ip daddr . tcp dport @bootstrap meta mark $bootstrap_mark ct mark set meta mark
-        meta mark $wgmark ip daddr . udp dport @peer ct mark set meta mark
+        meta mark $wgmark udp sport . ip daddr . udp dport @host_peer ct mark set meta mark
+        meta mark $wgmark udp sport . ip daddr . udp dport @app_peers ct mark set meta mark
     }
 
     chain restore_transport {
@@ -76,7 +82,8 @@ table inet walkervpn {
 
     chain block_output {
         oifname { "lo", "$iface" } accept
-        meta mark $wgmark ip daddr . udp dport @peer accept
+        meta mark $wgmark udp sport . ip daddr . udp dport @host_peer accept
+        meta mark $wgmark udp sport . ip daddr . udp dport @app_peers accept
         meta nfproto ipv4 meta skuid 0 udp sport 68 udp dport 67 accept
         counter drop
     }
@@ -92,7 +99,7 @@ table inet walkervpn {
 $restore_output
 $restore_forward
 RULES
-        if [[ -f $profile ]]; then
+        if [[ -f $profile ]] && tunnel_is_up; then
             endpoint=$(awk '$1 == "Endpoint" { print $3 }' "$profile")
             guard_peer "$endpoint" || return 1
         fi
@@ -100,12 +107,13 @@ RULES
             [[ -f $record ]] || continue
             read -r veth uplink pair < "$record"
             valid_interface "$veth" && valid_interface "$uplink" || continue
+            [[ -r /sys/class/net/$veth/ifindex && -r /sys/class/net/$uplink/ifindex ]] || continue
             [[ $pair == "$(< "/sys/class/net/$veth/ifindex") . $(< "/sys/class/net/$uplink/ifindex")" ]] ||
                 continue
             printf 'add element inet walkervpn direct { %s }\n' "$pair" | nft -f - || return 1
         done
+        guard_app_peers || return 1
     fi
-    guard_app_peers || return 1
     rules=$(ip -j -4 rule show) || return 1
     # Select the uplink source address at socket connect time. The nftables
     # route hook marks the approved connection for return-path filtering.
@@ -130,26 +138,28 @@ RULES
 }
 
 guard_app_peers() {
-    nft list set inet walkervpn app_peers >/dev/null 2>&1 && return 0
-    # This transaction also upgrades a running installation without flushing its guard.
-    nft -f - <<RULES || return 1
-add set inet walkervpn app_peers { type inet_service . ipv4_addr . inet_service; }
-insert rule inet walkervpn block_output meta mark $wgmark udp sport . ip daddr . udp dport @app_peers accept
-insert rule inet walkervpn remember_transport meta mark $wgmark udp sport . ip daddr . udp dport @app_peers ct mark set meta mark
-RULES
-    local record namespace port address endpoint live_endpoint
+    local record namespace port address endpoint live_endpoint live_mark
+    local -a rules=("flush set inet walkervpn app_peers")
+    local -a stale=()
     for record in "$run"/app-peer-wv*; do
         [[ -f $record ]] || continue
         namespace=${record##*/app-peer-}
-        [[ $namespace =~ ^wv[0-9a-f]{10}$ && -e /run/netns/$namespace ]] || continue
+        [[ $namespace =~ ^wv[0-9a-f]{10}$ ]] || continue
+        if [[ ! -e /run/netns/$namespace ]]; then
+            stale+=("$record")
+            continue
+        fi
         read -r port address endpoint < "$record" || continue
         valid_port "$port" && ipv4 "$address" && valid_port "$endpoint" || continue
         [[ $(nsenter --net="/run/netns/$namespace" wg show "$namespace" listen-port 2>/dev/null) == "$port" ]] || continue
+        live_mark=$(nsenter --net="/run/netns/$namespace" wg show "$namespace" fwmark 2>/dev/null) || continue
+        [[ $live_mark == "$(printf '0x%x' "$wgmark")" ]] || continue
         read -r _ live_endpoint < <(nsenter --net="/run/netns/$namespace" wg show "$namespace" endpoints 2>/dev/null) || continue
         [[ $live_endpoint == "$address:$endpoint" ]] || continue
-        printf 'add element inet walkervpn app_peers { %s . %s . %s }\n' "$port" "$address" "$endpoint" |
-            nft -f - || return 1
+        rules+=("add element inet walkervpn app_peers { $port . $address . $endpoint }")
     done
+    printf '%s\n' "${rules[@]}" | nft -f - || return 1
+    if ((${#stale[@]})); then rm -f -- "${stale[@]}"; fi
 }
 
 guard_armed() {
@@ -177,13 +187,14 @@ RULES
 }
 
 guard_peer() {
-    local setting=
+    local setting= port
     if [[ -n ${1:-} ]]; then
         ipv4 "${1%:*}" && valid_port "${1##*:}" || return 1
-        setting="add element inet walkervpn peer { ${1%:*} . ${1##*:} }"
+        port=$(wg show "$iface" listen-port) && valid_port "$port" || return 1
+        setting="add element inet walkervpn host_peer { $port . ${1%:*} . ${1##*:} }"
     fi
     nft -f - <<RULES
-flush set inet walkervpn peer
+flush set inet walkervpn host_peer
 $setting
 RULES
 }
@@ -240,8 +251,9 @@ tunnel_up() {
             return 1
         fi
     done
-    guard_peer "$endpoint" && wg-quick up "$profile" >&2 || return 1
-    if ! sysctl -q net.ipv4.conf.all.src_valid_mark=1 ||
+    wg-quick up "$profile" >&2 || return 1
+    if ! guard_peer "$endpoint" ||
+        ! sysctl -q net.ipv4.conf.all.src_valid_mark=1 ||
         ! ip -4 route add default dev "$iface" table "$wgmark" ||
         ! ip -6 route add default dev "$iface" table "$wgmark" ||
         ! ip -4 rule add pref "$tunnel_return_pref" iif "$iface" table main suppress_prefixlength 0 ||

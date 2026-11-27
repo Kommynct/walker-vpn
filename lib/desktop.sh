@@ -110,8 +110,9 @@ flatpak_command() {
                     fi
                 fi
                 if [[ $forwarding == true ]]; then
-                    # Exported launchers may carry an obsolete command after an update.
-                    command=
+                    # The main launcher follows the current deployment. A saved
+                    # secondary shortcut can explicitly request another command.
+                    if [[ -n $command ]] && ! flatpak_secondary_command "$id" "$command"; then command=; fi
                     local -a files=()
                     for argument; do
                         case "$argument" in @@|@@u) ;; *) files+=("$argument");; esac
@@ -135,6 +136,15 @@ flatpak_command() {
         done
     fi
     exec "$real" "${original[@]}"
+}
+
+flatpak_secondary_command() {
+    local id=$1 command=$2 record=$desktop_root/$1 entry
+    for entry in "$record/generated" "$record/shortcuts/"*.desktop/generated; do
+        [[ -f $entry ]] || continue
+        if rg -qF "Exec=walker-vpn desktop $id --flatpak-command $command -- " "$entry"; then return 0; fi
+    done
+    return 1
 }
 
 app_processes() {
@@ -419,10 +429,16 @@ refresh_flatpak_entry() {
 }
 
 repair_flatpak_export() (
-    local id=$1 record=$desktop_root/$1 export_file stamp edit shortcut exec_line
+    local id=$1 record=$desktop_root/$1 export_file stamp edit shortcut exec_line secondary
     local refresh_cache=${WALKER_VPN_REFRESH_EXPORT:-false}
     export_file=$(flatpak_export_desktop "$id") || return 0
-    stamp=$(stat -Lc '%d:%i:%s:%y' "$export_file") || return 1
+    local -a exports=("$export_file")
+    for shortcut in "$record/shortcuts/"*.desktop; do
+        [[ -f $shortcut/generated ]] || continue
+        secondary=$(flatpak_export_desktop "${shortcut##*/}") || continue
+        exports+=("$secondary")
+    done
+    stamp=$(stat -Lc '%d:%i:%s:%y' -- "${exports[@]}") || return 1
     if [[ -f $record/cache-stamp && $(< "$record/cache-stamp") == "$stamp" ]]; then refresh_cache=false; fi
     if [[ -f $record/export-stamp && $(< "$record/export-stamp") == "$stamp" &&
         -f $desktop_data/applications/$id && $refresh_cache == false ]]; then

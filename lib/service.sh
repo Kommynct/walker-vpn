@@ -61,7 +61,10 @@ acquire() {
     flock -w 65 "$lock"
 }
 
-release() { exec {lock}>&-; }
+release() {
+    exec {lock}>&-
+    unset lock
+}
 
 refresh_catalog() {
     local locations
@@ -82,18 +85,21 @@ get_catalog() {
     cat "$catalog_file"
 }
 
-save_login() {
-    local username password token
-    username=$(jq -er '.username | strings' <<< "$request") || return 1
-    password=$(jq -er '.password | strings' <<< "$request") || return 1
+save_login() (
+    local username password token temporary
+    local filter='strings | select(index("\u0000") == null and index("\n") == null and index("\r") == null)'
+    username=$(jq -er ".username | $filter" <<< "$request") || return 1
+    password=$(jq -er ".password | $filter" <<< "$request") || return 1
     token=$(pia_token "$username" "$password") || return 1
+    temporary=$(mktemp -d "$state/login.XXXXXXXX") || return 1
+    trap 'rm -rf -- "$temporary"' EXIT
     printf '%s\n%s\n' "$username" "$password" |
-        systemd-creds encrypt --with-key=host --name=pia-login - "$state/pia-login.tmp" >&2 ||
+        systemd-creds encrypt --with-key=host --name=pia-login - "$temporary/credential" >&2 ||
         return 1
+    mv -fT -- "$temporary/credential" "$state/pia-login.cred" || return 1
     rm -f "$run/pia-token"
-    mv -f "$state/pia-login.tmp" "$state/pia-login.cred" || return 1
     printf '%s\n' "$token" > "$run/pia-token" || rm -f "$run/pia-token"
-}
+)
 
 saved_token() {
     local login username password token
@@ -196,18 +202,24 @@ recover() {
 }
 
 maintain() {
+    local app_peers=false
     find "$run" -maxdepth 1 -type f -name 'result-*' -mmin +5 -delete || :
     exec {lock}>"$run/manager.lock"
     flock -n "$lock" || return 0
     rm -f "$run/pending-region"
-    if [[ -f $run/preview ]] && (( EPOCHSECONDS >= $(< "$run/preview") )); then
-        guard_set off || return 1
-    fi
-    if [[ -e $run/armed || -f $run/region ]]; then
-        if ! guard_init || ! recover; then
+    if compgen -G "$run/app-peer-wv*" >/dev/null; then app_peers=true; fi
+    if [[ -e $run/armed || -f $run/region || $app_peers == true ]]; then
+        if ! guard_init || { [[ $app_peers == true ]] && ! guard_app_peers; }; then
             publish_status || :
             return 1
         fi
+    fi
+    if [[ -f $run/preview ]] && (( EPOCHSECONDS >= $(< "$run/preview") )); then
+        guard_set off || return 1
+    fi
+    if ! recover; then
+        publish_status || :
+        return 1
     fi
     if [[ ! -s $view/locations.json && -s $catalog_file ]]; then
         local locations

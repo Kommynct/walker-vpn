@@ -4,13 +4,19 @@ app_netns_config=/etc/netns
 app_cleanup() {
     if [[ -n ${active_record:-} && -n ${active_lease:-} ]]; then
         flock -x "$active_lease" || return 1
+        # A concurrent launch can detach a new process after the first scan,
+        # while it still holds its shared lease. Check again with launches blocked.
+        if [[ ${cleanup_uid:-} ]]; then wait_for_app_processes "$namespace" "$cleanup_uid"; fi
         if [[ -f $active_record && $(< "$active_record") == "$namespace $app_iface $mode $work $region" ]]; then
             rm -f -- "$active_record"
         fi
     fi
     if [[ -n ${app_peer:-} ]]; then
-        rm -f -- "$run/app-peer-$namespace"
-        printf 'delete element inet walkervpn app_peers { %s }\n' "$app_peer" | nft -f - >&2 || :
+        if [[ -z ${lock:-} ]]; then acquire || return 1; fi
+        if printf 'delete element inet walkervpn app_peers { %s }\n' "$app_peer" | nft -f - >&2; then
+            rm -f -- "$run/app-peer-$namespace"
+        fi
+        release
     fi
     if [[ ${owns_wireguard:-false} == true ]]; then
         local -a netns=()
@@ -131,6 +137,9 @@ app_policy() {
     IFS=$'\t' read -r veth uplink_index <<< "$links"
     valid_interface "$inside" && valid_interface "$veth" && valid_interface "$uplink" || return 1
     app_iface=$inside
+    # Strict reverse-path checks can select the host tunnel for the app's
+    # source and drop its ARP requests. The forward chain pins the source.
+    sysctl -qw "net/ipv4/conf/$veth/rp_filter=2" || return 1
     if [[ $mode == direct ]]; then
         reverse_mark="iifname \"$veth\" oifname \"$uplink\" meta nfproto ipv4 ct mark set $bootstrap_mark"
     else
@@ -155,6 +164,7 @@ table inet $namespace {
     chain forward {
         type filter hook forward priority -20; policy accept;
         iifname "$veth" meta nfproto ipv6 drop
+        iifname "$veth" ip saddr != $app_address drop
         iifname "$veth" oifname != "$uplink" drop
         oifname "$veth" iifname != "$uplink" drop
         $reverse_mark
@@ -213,7 +223,7 @@ start_forwarded_app() {
 }
 
 launch_app() {
-    local app_kind app_id uid gid home user_entry job forward_files argc result=0
+    local app_kind app_id uid gid home user_entry job forward_files argc result=0 cleanup_uid=
     mode= region= namespace= work= veth= pair= vpn_pid= active_record= active_lease= app_iface=
     owns_netns=false owns_netns_dns=false owns_wireguard=false wireguard_moved=false app_peer=
     app_route_table= app_route_denied=false
@@ -278,8 +288,8 @@ launch_app() {
         start_forwarded_app || return 1
     elif [[ $region != host ]]; then
         start_app_tunnel "$region" || { fail 'Could not connect to the app’s selected VPN location.'; return; }
-    elif guard_armed || [[ -e $run/armed ]]; then
-        fail 'Connect the host VPN or select a VPN location for this app while the kill switch is on.'
+    elif [[ -n $app_id ]] || guard_armed || [[ -e $run/armed ]]; then
+        fail 'Connect the host VPN or select a separate VPN location for this app.'
         return
     else
         start_app_tunnel optimal || { fail 'Could not register a WireGuard peer for this app.'; return; }
@@ -299,8 +309,9 @@ launch_app() {
     fi
     run_app_in_namespace || result=$?
     wait_for_app_processes "$namespace" "$uid"
+    cleanup_uid=$uid
     trap - EXIT
-    app_cleanup
+    app_cleanup || result=1
     printf '%s\n' "$result" > "$run/result-$job"
     return "$result"
 }

@@ -9,11 +9,13 @@ Walker VPN protects direct IP traffic from apps started through a managed launch
 - Native apps that exit immediately after a denied D-Bus name request retry on a private session bus. That bus has no host service activation or desktop integration. The app keeps its assigned network namespace.
 - The desktop link socket is owned by the user and accepts only HTTP and HTTPS URLs. The desktop opens the link using its configured handler, so the browser’s own routing policy applies. The socket does not run commands supplied by routed apps.
 - The root-owned runtime registry associates repeat launches with the original app’s route and namespace. Policy changes require the app to stop. Shared leases keep the namespace in place during repeat launches. Detached processes keep it alive until they exit.
-- A dedicated VPN location gives the app a namespace with only loopback and WireGuard. The WireGuard UDP socket stays in the host namespace. While the host kill switch is armed, the firewall allows its marked transport only for the registered local UDP port and peer IP and port.
+- A dedicated VPN location gives the app a namespace with only loopback and WireGuard. The WireGuard UDP socket stays in the host namespace. The armed firewall checks the WireGuard mark, local UDP port, peer IPv4 address, and peer UDP port for both host and dedicated transports.
 - Saved PIA credentials are encrypted with a machine credential key. WireGuard private keys and generated profiles belong to the privileged service. Client requests and startup failures avoid logging credential values or provider configuration.
 
 ## Checks
 
 A launch requires a separate mount and network namespace, the expected interface, DNS configuration, and the namespace’s default-drop output chain. Host routing rules stop forwarded app traffic when its selected routing table has no route. This applies to excluded apps using the main table and VPN-only apps using the host tunnel. The Flatpak launcher also checks for the expected network interface and resolver configuration from inside its sandbox. The regression tests cover shortcut migration, MIME arguments, route mismatch rejection, and detached-process lifetime.
+
+The maintenance timer can rebuild a removed host firewall table from runtime state. A privileged firewall flush can remove host kill-switch enforcement until that rebuild completes.
 
 Testing the kernel, Flatpak, systemd, Vopono, and PIA implementations themselves is outside the scope of this project.

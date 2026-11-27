@@ -88,3 +88,19 @@ rm "$scratch/launch"
 if flatpak_command run --share=network "$app"; then exit 1; fi
 [[ -s $scratch/notice && ! -e $scratch/launch ]]
 printf 'A cached export repairs the launcher, refreshes once, and opens the current executable under its saved route. Unsupported options fail closed.\n'
+
+# A secondary export may change while the main export stays identical.
+settings=org.example.Settings.desktop
+shortcut=$record/shortcuts/$settings
+mkdir -p "$shortcut"
+printf '[Desktop Entry]\nName=Settings\nExec=flatpak run --command=settings-old %s --settings\n' "$app" > "$exports/$settings"
+render_desktop "$exports/$settings" "$id" flatpak true > "$shortcut/generated"
+cp "$shortcut/generated" "$desktop_data/applications/$settings"
+flatpak_command run "$app"
+sed -i 's/settings-old/settings-new/' "$exports/$settings"
+flatpak_command run "$app"
+rg -Fq -- '--flatpak-command settings-new -- --settings' "$desktop_data/applications/$settings"
+flatpak_command run --command=settings-new --file-forwarding "$app" @@u "$uri" @@
+mapfile -t launch < "$scratch/launch"
+[[ ${launch[3]} == settings-new && ${launch[4]} == "$uri" ]]
+printf 'A secondary export refreshes independently and preserves its command during file forwarding.\n'
