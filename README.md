@@ -60,3 +60,7 @@ The [KDE WireGuard applet](https://github.com/minkytown/KDE-Wireguard-applet) pr
 The desktop account owns the control socket, launcher overrides, and saved routing choices. These policies protect ordinary launches against accidental use of the wrong network. Software with the same account's access to the control socket or configuration can change those choices. Network namespaces govern direct socket traffic. A host service contacted through local IPC can make its own connections under its own policy.
 
 The [security model](SECURITY.md) describes the routing guarantees and trust boundaries.
+
+A failed connection attempt leaves automatically armed protection on, including
+when provider registration fails. Explicit kill-off is respected. Use Disconnect
+or turn off the kill switch to deliberately restore ordinary internet.
