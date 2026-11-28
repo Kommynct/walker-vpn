@@ -125,8 +125,12 @@ build_profile() {
 }
 
 connect_host() {
-    local wanted=$1 temp selected saved=0 armed_here=0
+    local wanted=$1 temp selected saved=0
     temp=$(mktemp -d "$run/connect.XXXXXXXX") || return 1
+    # Arm before provider requests and remain fail-closed on failure.
+    if [[ ! -e $run/preference-off ]] && ! guard_armed; then
+        guard_set on || { rm -rf -- "$temp"; return 1; }
+    fi
     if ! selected=$(build_profile "$wanted" "$temp/provider.conf") ||
         ! make_host_profile "$temp/provider.conf" "$temp/host.conf"; then
         rm -rf -- "$temp"
@@ -136,12 +140,7 @@ connect_host() {
         cp -f "$profile" "$temp/previous.conf" || { rm -rf -- "$temp"; return 1; }
         saved=1
     fi
-    if [[ ! -e $run/preference-off ]] && ! guard_armed; then
-        guard_set on || { rm -rf -- "$temp"; return 1; }
-        armed_here=1
-    fi
     if ! tunnel_down; then
-        if (( armed_here )); then guard_set off || :; fi
         rm -rf -- "$temp"
         return 1
     fi
@@ -165,7 +164,6 @@ connect_host() {
         rm -f "$profile" "$run/region"
         guard_peer '' || :
     fi
-    if (( armed_here )); then guard_set off || :; fi
     rm -rf -- "$temp"
     return 1
 }

@@ -24,7 +24,12 @@ for directory in "${search_path[@]}"; do
 done
 PATH=$resolved_path
 mount --make-rprivate /
+resolver_target=$(readlink -f /etc/resolv.conf)
 mount -t tmpfs tmpfs /run
+if [[ $resolver_target == /run/* ]]; then
+    mkdir -p "${resolver_target%/*}"
+    : > "$resolver_target"
+fi
 mount -t sysfs sysfs /sys
 source "${BASH_SOURCE[0]%/*}/../lib/guard.sh"
 id() { [[ $* == '-u walker-vpn-api' ]] && printf '123\n'; }
